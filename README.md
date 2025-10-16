@@ -16,6 +16,8 @@ An advanced AI-powered application that uses AutoGen (AG2) and Azure OpenAI to c
 
 ## 🏗️ Architecture
 
+![Diagram](images/diagram_teeratornk_blog_post.jpg)
+
 ### Core Agents
 
 1. **Writer Agent**: Creates initial blog content based on user requirements
