@@ -60,7 +60,6 @@ htmlcov/
 
 # Project specific
 *.json
-!requirements.txt
 output/
 exports/
 temp/
@@ -68,3 +67,5 @@ temp/
 # OS files
 Thumbs.db
 .DS_Store
+
+spec.md

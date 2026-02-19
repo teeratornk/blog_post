@@ -19,12 +19,12 @@ An advanced AI-powered application that uses AutoGen (AG2) and Azure OpenAI to c
 ### Core Agents
 
 1. **Writer Agent**: Creates initial blog content based on user requirements
-   - Uses GPT-5-2 model for creative content generation
+   - Uses gpt-5.2 model for creative content generation
    - Iteratively refines content based on reviewer feedback
    - Returns polished final draft without additional commentary
 
 2. **Critic Agent**: Orchestrates the review process and synthesizes feedback
-   - Uses O3 model for analysis and coordination
+   - Uses o3 model for analysis and coordination
    - Manages nested chat conversations with all reviewers
    - Focuses on high-impact, actionable improvements
    - Triggers termination when content meets quality standards
@@ -131,11 +131,12 @@ This ensures:
 
 ## 📋 Prerequisites
 
-- Python 3.8+
+- [uv](https://docs.astral.sh/uv/) — fast Python package manager
+- Python 3.10+
 - Azure OpenAI API access with:
-  - GPT-5-2 deployment (for content generation)
-  - O3 deployment (for review and editing)
-  - GPT-Image-1 deployment (for image generation)
+  - gpt-5.2 deployment (for content generation)
+  - o3 deployment (for review and editing)
+  - gpt-image-1 deployment (for image generation)
 - Required API credentials:
   - Azure endpoint URL
   - API key
@@ -149,18 +150,12 @@ git clone <repository-url>
 cd blog_post
 ```
 
-2. Create a virtual environment:
+2. Install dependencies:
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+uv sync
 ```
 
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-4. Set up environment variables:
+3. Set up environment variables:
 ```bash
 # Create .env file
 cp .env.example .env
@@ -171,11 +166,11 @@ AZURE_OPENAI_API_KEY=your-api-key
 AZURE_OPENAI_API_VERSION=2024-10-01-preview
 
 # Model deployments (as configured in your Azure resource)
-AZURE_OPENAI_MODEL_WRITER=gpt-5-2
+AZURE_OPENAI_MODEL_WRITER=gpt-5.2
 AZURE_OPENAI_MODEL_EDITOR=o3
 AZURE_OPENAI_MODEL_CRITIC=o3
 AZURE_OPENAI_MODEL_T2I=gpt-image-1
-AZURE_OPENAI_MODEL_DEFAULT=gpt-5-2
+AZURE_OPENAI_MODEL_DEFAULT=gpt-5.2
 ```
 
 ## 🔧 Configuration System
@@ -210,7 +205,7 @@ The configuration system automatically assigns appropriate models to each agent 
 ```python
 # Role to model mapping
 {
-    "writer": "gpt-5-2",      # Main content creation
+    "writer": "gpt-5.2",      # Main content creation
     "critic": "o3",           # Review orchestration
     "editor": "o3",           # Final refinement
     "seo": "o3",             # SEO optimization
@@ -224,7 +219,7 @@ The configuration system automatically assigns appropriate models to each agent 
 
 ### Model Descriptions
 
-- **gpt-5-2**: Advanced language model optimized for creative content generation
+- **gpt-5.2**: Advanced language model optimized for creative content generation
 - **o3**: High-performance model for analysis, review, and refinement tasks
 - **gpt-image-1**: Specialized model for text-to-image generation
 
@@ -247,7 +242,7 @@ The system includes helper functions for building agent configurations:
 
 1. Start the application:
 ```bash
-streamlit run app.py
+uv run streamlit run app.py
 ```
 
 2. Configure settings in the sidebar:
@@ -297,7 +292,8 @@ blog_post/
 ├── agents.py           # Agent definitions and initialization
 ├── config.py           # Configuration and LLM setup
 ├── utils.py            # Utility functions and models
-├── requirements.txt    # Python dependencies
+├── pyproject.toml      # Project metadata and dependencies
+├── uv.lock             # Locked dependency versions
 ├── .env.example        # Environment variables template
 └── README.md          # This file
 ```
@@ -420,7 +416,7 @@ blog_post/
 
 4. **Missing dependencies**
    ```bash
-   pip install --upgrade -r requirements.txt
+   uv sync
    ```
 
 5. **Streaming mode issues**
