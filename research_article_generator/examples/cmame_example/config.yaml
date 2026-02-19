@@ -1,0 +1,33 @@
+project_name: "Physics-Informed Neural Networks for Computational Mechanics"
+template: elsarticle
+journal_name: "Computer Methods in Applied Mechanics and Engineering"
+page_budget: 20
+latex_engine: pdflatex
+bib_style: elsarticle-num
+
+draft_dir: drafts/
+figure_dir: figures/
+bibliography: references.bib
+output_dir: output/
+
+azure:
+  api_key: "${AZURE_OPENAI_API_KEY}"
+  api_version: "${AZURE_OPENAI_API_VERSION}"
+  endpoint: "${AZURE_OPENAI_ENDPOINT}"
+
+models:
+  default: gpt-5.2
+  assembler: gpt-5.2
+  reviewer: gpt-5.2
+
+compile_max_attempts: 3
+review_max_turns: 2
+review_max_rounds: 2
+timeout: 120
+seed: 42
+
+enabled_reviewers:
+  LaTeXLinter: true
+  StyleChecker: true
+  FaithfulnessChecker: true
+  MetaReviewer: true

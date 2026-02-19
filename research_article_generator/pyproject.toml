@@ -1,0 +1,25 @@
+[project]
+name = "research-article-generator"
+version = "0.1.0"
+description = "CLI tool that transforms markdown research drafts + figures into publication-ready LaTeX documents"
+requires-python = ">=3.10"
+dependencies = [
+    "ag2[openai]",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0",
+    "openai>=1.40.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0",
+    "rich-click>=1.7.0",
+    "click>=8.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.8"]
+
+[project.scripts]
+rag = "research_article_generator.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
