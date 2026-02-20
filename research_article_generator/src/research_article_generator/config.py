@@ -118,6 +118,8 @@ def build_role_llm_config(role: str, config: ProjectConfig) -> dict[str, Any]:
         "meta_reviewer": models.reviewer,
         "equation_formatter": models.assembler,
         "figure_integrator": models.assembler,
+        "tikz_generator": models.assembler,
+        "tikz_reviewer": models.assembler,
         "citation_agent": models.reviewer,
         "page_budget": models.reviewer,
         "editor": models.editor,

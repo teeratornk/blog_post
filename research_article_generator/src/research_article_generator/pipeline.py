@@ -22,6 +22,7 @@ import autogen
 from .agents.citation_agent import make_citation_agent
 from .agents.equation_formatter import make_equation_formatter
 from .agents.figure_integrator import make_figure_integrator
+from .agents.tikz_generator import make_tikz_generator, make_tikz_reviewer, validate_tikz_review
 from .agents.latex_assembler import make_assembler
 from .agents.page_budget_manager import make_page_budget_manager
 from .agents.reviewers import make_meta_reviewer, make_reviewers, reflection_message, build_summary_args
@@ -479,6 +480,10 @@ class Pipeline:
         for section_id, latex in list(self.section_latex.items()):
             self.callbacks.on_section_start(section_id)
 
+            # TikZ diagram generation + review pass (before equation/figure passes)
+            if self.config.tikz_enabled:
+                latex = self._tikz_generate_and_review(section_id, latex, orchestrator)
+
             # Equation formatting pass
             try:
                 eq_formatter = make_equation_formatter(self.config)
@@ -607,6 +612,14 @@ class Pipeline:
             self.callbacks.on_compile_attempt(attempt, self.config.compile_max_attempts)
 
             result = run_latexmk(self.output_dir, self.config.latex_engine)
+            logger.info(
+                "[compile-fix] attempt %d/%d: success=%s, errors=%d, unresolved=%d",
+                attempt, self.config.compile_max_attempts,
+                result.success, len(result.errors), len(result.unresolved_refs),
+            )
+            if result.errors:
+                for err in result.errors:
+                    logger.info("  error: %s (file=%s, line=%s)", err.message, err.file, err.line)
 
             if result.success:
                 if result.unresolved_refs:
@@ -742,6 +755,10 @@ class Pipeline:
             write_section_files(self.section_latex, self.output_dir)
             result = run_latexmk(self.output_dir, self.config.latex_engine)
             self.compilation_result = result
+            logger.info(
+                "[meta-review] round %d recompile: success=%s, errors=%d",
+                round_num, result.success, len(result.errors),
+            )
 
             if result.success:
                 break
@@ -757,6 +774,10 @@ class Pipeline:
                 self.compilation_result = result
                 break
 
+        logger.info(
+            "[COMPILATION_REVIEW] final result: success=%s, errors=%d, pdf=%s",
+            result.success, len(result.errors), result.pdf_path,
+        )
         self.callbacks.on_phase_end("COMPILATION_REVIEW", result.success)
         return result
 
@@ -1214,6 +1235,141 @@ class Pipeline:
     # -----------------------------------------------------------------------
     # Helper methods
     # -----------------------------------------------------------------------
+
+    def _tikz_generate_and_review(
+        self,
+        section_id: str,
+        latex: str,
+        orchestrator: autogen.UserProxyAgent,
+    ) -> str:
+        """Generate TikZ diagrams and run a structured review-fix loop.
+
+        1. Generate TikZ via the generator agent.
+        2. If no ``\\begin{tikzpicture}`` in output → return as-is.
+        3. Review-fix loop (up to ``tikz_review_max_turns`` rounds):
+           - Reviewer examines section → returns structured JSON.
+           - Parse via ``validate_tikz_review()``.
+           - On verdict ``PASS`` → break.
+           - On ``FAIL`` → build severity-sorted fix prompt with
+             accumulated issue history → fresh generator fixes → loop.
+        4. Graceful fallback: return original *latex* on any failure.
+        """
+        original = latex
+
+        # Step 1: Generate
+        try:
+            tikz_gen = make_tikz_generator(self.config)
+            response = orchestrator.initiate_chat(
+                tikz_gen,
+                message=f"Analyze this section and generate TikZ diagrams where appropriate:\n\n{latex}",
+                max_turns=1,
+            )
+            updated = _extract_latex(response)
+            if updated and _looks_like_latex(updated):
+                latex = updated
+            else:
+                return original
+        except Exception as e:
+            self.callbacks.on_warning(f"TikZGenerator skipped for {section_id}: {e}")
+            return original
+
+        # Step 2: Short-circuit if no diagrams were produced
+        if r"\begin{tikzpicture}" not in latex:
+            return latex
+
+        # Step 3: Structured review-fix loop
+        issue_history: list[list[dict[str, str]]] = []  # per-round issue lists
+
+        for turn in range(self.config.tikz_review_max_turns):
+            try:
+                reviewer = make_tikz_reviewer(self.config)
+                review_response = orchestrator.initiate_chat(
+                    reviewer,
+                    message=f"Review the TikZ diagrams in this LaTeX section:\n\n{latex}",
+                    max_turns=1,
+                )
+                raw_verdict = _extract_latex(review_response).strip()
+            except Exception as e:
+                self.callbacks.on_warning(f"TikZReviewer skipped for {section_id}: {e}")
+                break
+
+            # Parse structured result
+            result = validate_tikz_review(raw_verdict)
+            if result is None:
+                # Unparseable — treat as PASS to avoid infinite loop
+                logger.warning("TikZ review unparseable for %s, treating as PASS", section_id)
+                break
+
+            self.callbacks.on_warning(
+                f"TikZ review {section_id} round {turn + 1}: "
+                f"verdict={result.verdict}, issues={len(result.issues)}"
+            )
+
+            if result.verdict == "PASS":
+                break
+
+            # Accumulate issues for history
+            round_issues = [
+                {"category": iss.category, "severity": iss.severity.value, "description": iss.description}
+                for iss in result.issues
+            ]
+            issue_history.append(round_issues)
+
+            # Build severity-sorted fix prompt
+            fix_prompt = self._build_tikz_fix_prompt(latex, result.issues, issue_history)
+
+            # Fix
+            try:
+                fixer = make_tikz_generator(self.config)
+                fix_response = orchestrator.initiate_chat(
+                    fixer,
+                    message=fix_prompt,
+                    max_turns=1,
+                )
+                fixed = _extract_latex(fix_response)
+                if fixed and _looks_like_latex(fixed):
+                    latex = fixed
+                else:
+                    break
+            except Exception as e:
+                self.callbacks.on_warning(f"TikZ fix skipped for {section_id}: {e}")
+                break
+
+        return latex
+
+    @staticmethod
+    def _build_tikz_fix_prompt(
+        latex: str,
+        current_issues: list,
+        issue_history: list[list[dict[str, str]]],
+    ) -> str:
+        """Build a severity-sorted fix prompt with accumulated issue history."""
+        from .models import Severity
+
+        # Sort current issues: ERROR first, then WARNING, then INFO
+        severity_order = {Severity.CRITICAL: 0, Severity.ERROR: 1, Severity.WARNING: 2, Severity.INFO: 3}
+        sorted_issues = sorted(current_issues, key=lambda i: severity_order.get(i.severity, 3))
+
+        parts = [
+            "Fix the following TikZ issues in this LaTeX section. "
+            "Return the COMPLETE section with corrected diagrams.\n"
+        ]
+
+        # Current issues grouped by severity
+        parts.append("CURRENT ISSUES (fix these now):")
+        for iss in sorted_issues:
+            parts.append(f"  [{iss.severity.value.upper()}] [{iss.category}] {iss.description}")
+
+        # Prior round history (so fixer knows what was already tried)
+        if len(issue_history) > 1:
+            parts.append("\nPRIOR ROUND ISSUES (already attempted — avoid repeating these mistakes):")
+            for round_num, round_issues in enumerate(issue_history[:-1], 1):
+                parts.append(f"  Round {round_num}:")
+                for iss in round_issues:
+                    parts.append(f"    [{iss['severity'].upper()}] [{iss['category']}] {iss['description']}")
+
+        parts.append(f"\nSECTION:\n{latex}")
+        return "\n".join(parts)
 
     def _sanitize_missing_figures(self) -> bool:
         """Comment out missing-figure references across all sections.

@@ -26,6 +26,7 @@ class PipelinePhase(str, Enum):
     POST_PROCESSING = "post_processing"
     COMPILATION_REVIEW = "compilation_review"
     PAGE_BUDGET = "page_budget"
+    SUPPLEMENTARY = "supplementary"
     FINALIZATION = "finalization"
 
 
@@ -61,6 +62,19 @@ class StructurePlan(BaseModel):
 # Phase 4: Compilation
 # ---------------------------------------------------------------------------
 
+class TikZIssue(BaseModel):
+    """A single issue found during TikZ diagram review."""
+    category: str = Field(..., description="Issue category: syntax, spacing, labels, libraries, layout, or integration")
+    severity: Severity = Field(..., description="Issue severity")
+    description: str = Field(..., description="Human-readable description of the issue")
+
+
+class TikZReviewResult(BaseModel):
+    """Structured result from the TikZ reviewer agent."""
+    verdict: str = Field(..., description="'PASS' or 'FAIL'")
+    issues: list[TikZIssue] = Field(default_factory=list, description="List of issues found")
+
+
 class CompilationWarning(BaseModel):
     """A single warning or error from LaTeX compilation."""
     file: str = Field(default="", description="Source file")
@@ -92,6 +106,14 @@ class ReviewFeedback(BaseModel):
     severity: Severity = Field(default=Severity.WARNING, description="Overall severity")
 
 
+class SectionReviewResult(BaseModel):
+    """Per-section review outcome from Phase 2 review loop."""
+    section_id: str = Field(..., description="Section identifier")
+    reviews: list[ReviewFeedback] = Field(default_factory=list, description="Reviews collected")
+    faithfulness: "FaithfulnessReport | None" = Field(default=None, description="Per-section faithfulness check")
+    fix_applied: bool = Field(default=False, description="Whether a fix was applied after review")
+
+
 # ---------------------------------------------------------------------------
 # Faithfulness Checking
 # ---------------------------------------------------------------------------
@@ -119,15 +141,40 @@ class FaithfulnessReport(BaseModel):
 # Phase 5: Page Budget
 # ---------------------------------------------------------------------------
 
+class SupplementaryClassification(BaseModel):
+    """Per-section classification for supplementary placement."""
+    section_id: str = Field(..., description="Section identifier")
+    placement: str = Field(..., description="'main' or 'supplementary'")
+    reasoning: str = Field(..., description="Why this section belongs there")
+    priority: int = Field(default=1, description="Priority (1=highest)")
+    estimated_pages: float = Field(default=0.0, description="Estimated page count")
+
+
+class SupplementaryPlan(BaseModel):
+    """Complete plan for supplementary material generation."""
+    mode: str = Field(default="standalone", description="'appendix' or 'standalone'")
+    main_sections: list[str] = Field(default_factory=list, description="Sections staying in main document")
+    supplementary_sections: list[str] = Field(default_factory=list, description="Sections moving to supplementary")
+    supplementary_figures: list[str] = Field(default_factory=list, description="Figures moving to supplementary")
+    classifications: list[SupplementaryClassification] = Field(default_factory=list, description="Per-section classifications")
+    estimated_main_pages: float = Field(default=0.0, description="Estimated main document pages after split")
+    estimated_supp_pages: float = Field(default=0.0, description="Estimated supplementary pages")
+    cross_reference_note: str = Field(
+        default="See Supplementary Materials for additional details.",
+        description="Note to insert in main document",
+    )
+
+
 class SplitDecision(BaseModel):
     """Advisory output from PageBudgetManager."""
-    action: str = Field(..., description="'ok', 'warn_over', or 'warn_under'")
+    action: str = Field(..., description="'ok', 'warn_over', 'warn_under', or 'split'")
     current_pages: int = Field(default=0)
     budget_pages: int | None = Field(default=None)
     sections_to_move: list[str] = Field(default_factory=list, description="Sections to consider moving to appendix/supplementary")
     figures_to_move: list[str] = Field(default_factory=list, description="Figures to consider moving")
     estimated_savings: float = Field(default=0.0, description="Estimated page savings")
     recommendations: str = Field(default="", description="Human-readable recommendations")
+    supplementary_plan: SupplementaryPlan | None = Field(default=None, description="Detailed supplementary plan when action is 'split'")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +186,7 @@ class BuildManifest(BaseModel):
     project_name: str = Field(...)
     output_dir: str = Field(...)
     main_tex: str = Field(default="main.tex")
+    section_files: list[str] = Field(default_factory=list, description="Section .tex files under sections/")
     pdf_file: str | None = Field(default=None)
     source_files: list[str] = Field(default_factory=list)
     figure_files: list[str] = Field(default_factory=list)
@@ -149,6 +197,9 @@ class BuildManifest(BaseModel):
     faithfulness_passed: bool = Field(default=False)
     page_count: int | None = Field(default=None)
     warnings: list[str] = Field(default_factory=list)
+    supplementary_tex: str | None = Field(default=None, description="Path to supplementary .tex file")
+    supplementary_pdf: str | None = Field(default=None, description="Path to supplementary .pdf file")
+    supplementary_sections: list[str] = Field(default_factory=list, description="Sections moved to supplementary")
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +268,16 @@ class ProjectConfig(BaseModel):
     timeout: int = Field(default=120, description="LLM call timeout in seconds")
     seed: int = Field(default=42, description="LLM seed for reproducibility")
 
+    # Supplementary materials
+    supplementary_mode: str = Field(
+        default="disabled",
+        description="'disabled', 'appendix', 'standalone', or 'auto'",
+    )
+    supplementary_threshold: float = Field(
+        default=1.2,
+        description="Page ratio threshold for auto mode (page_count / page_budget)",
+    )
+
     # Enabled reviewers
     enabled_reviewers: dict[str, bool] = Field(
         default_factory=lambda: {
@@ -226,3 +287,7 @@ class ProjectConfig(BaseModel):
             "MetaReviewer": True,
         }
     )
+
+    # TikZ diagram generation
+    tikz_enabled: bool = Field(default=False, description="Enable TikZ diagram generation from text")
+    tikz_review_max_turns: int = Field(default=3, description="Max TikZ review-fix rounds")
