@@ -1,9 +1,9 @@
 """Pipeline — 6-phase orchestration for research article generation.
 
 Phase 1: PLANNING         — StructurePlanner analyzes inputs
-Phase 2: CONVERSION       — Pandoc + LaTeXAssembler per section
-Phase 3: POST-PROCESSING  — Equations, figures, citations
-Phase 4: COMPILATION + REVIEW — latexmk, ChkTeX, nested reviewer chats
+Phase 2: CONVERSION       — Pandoc + LLM polish + per-section review
+Phase 3: POST-PROCESSING  — Per-section equation/figure/citation + multi-file assembly
+Phase 4: COMPILATION + META-REVIEW — compile, meta-review on summaries, fix affected sections
 Phase 5: PAGE BUDGET      — Advisory page count analysis
 Phase 6: FINALIZATION     — Manifest, output copy, final verify
 """
@@ -26,26 +26,36 @@ from .agents.latex_assembler import make_assembler
 from .agents.page_budget_manager import make_page_budget_manager
 from .agents.reviewers import make_meta_reviewer, make_reviewers, reflection_message, build_summary_args
 from .agents.structure_planner import make_structure_planner
+from .config import build_role_llm_config
 from .logging_config import PipelineCallbacks, RichCallbacks, logger
 from .models import (
     BuildManifest,
     CompilationResult,
     FaithfulnessReport,
+    FaithfulnessViolation,
     PipelinePhase,
     PipelineResult,
     ProjectConfig,
+    ReviewFeedback,
+    SectionReviewResult,
+    Severity,
     SplitDecision,
     StructurePlan,
     SectionPlan,
+    SupplementaryPlan,
 )
 from .tools.compiler import extract_error_context, run_latexmk
 from .tools.diff_checker import run_faithfulness_check
 from .tools.latex_builder import (
     assemble_document,
+    assemble_main_tex,
+    assemble_supplementary_tex,
     generate_makefile,
     generate_preamble,
     write_main_tex,
     write_makefile,
+    write_section_files,
+    write_supplementary_tex,
 )
 from .tools.linter import run_lint
 from .tools.page_counter import count_pages
@@ -57,6 +67,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _looks_like_latex(text: str) -> bool:
+    """Heuristic check that text is LaTeX, not reviewer JSON or garbage."""
+    latex_markers = ["\\begin{", "\\section", "\\documentclass", "\\usepackage", "\\end{"]
+    return any(m in text for m in latex_markers)
+
 
 def _extract_latex(response: Any) -> str:
     """Extract LaTeX string from an AG2 chat response."""
@@ -110,12 +126,87 @@ def _list_figure_files(figure_dir: str | Path) -> list[Path]:
     return sorted(f for f in d.iterdir() if f.suffix.lower() in exts)
 
 
+# Regex to match \includegraphics[...]{path} or \includegraphics{path}
+_INCLUDEGRAPHICS_RE = re.compile(
+    r"(\\includegraphics\s*(?:\[[^\]]*\])?\s*\{)([^}]+)(\})"
+)
+
+# Regex to match a complete figure environment containing a missing graphic
+_FIGURE_ENV_RE = re.compile(
+    r"(\\begin\{figure\}.*?\\end\{figure\})",
+    re.DOTALL,
+)
+
+
+def _comment_missing_figures(latex: str, output_dir: Path) -> tuple[str, list[str]]:
+    """Comment out figure environments that reference non-existent image files.
+
+    Returns (modified_latex, list_of_commented_paths).
+    """
+    commented: list[str] = []
+
+    def _fig_path_exists(path_str: str) -> bool:
+        """Check if a figure file exists in the output directory."""
+        p = Path(path_str)
+        # Check relative to output_dir
+        if (output_dir / p).exists():
+            return True
+        # Check just the filename in figures/
+        if (output_dir / "figures" / p.name).exists():
+            return True
+        return False
+
+    # Find all \includegraphics references and check which are missing
+    # (skip already-commented lines to ensure idempotency)
+    missing_paths: set[str] = set()
+    for m in _INCLUDEGRAPHICS_RE.finditer(latex):
+        # Check if this match is on a commented line
+        line_start = latex.rfind("\n", 0, m.start()) + 1
+        line_prefix = latex[line_start:m.start()].lstrip()
+        if line_prefix.startswith("%"):
+            continue
+        fig_path = m.group(2).strip()
+        if not _fig_path_exists(fig_path):
+            missing_paths.add(fig_path)
+
+    if not missing_paths:
+        return latex, []
+
+    # Comment out entire figure environments that contain missing graphics
+    def _comment_figure_env(match: re.Match) -> str:
+        env_text = match.group(1)
+        for mp in missing_paths:
+            if mp in env_text:
+                commented.append(mp)
+                # Comment out each line of the figure environment
+                lines = env_text.split("\n")
+                return "\n".join(f"% [missing figure] {line}" for line in lines)
+        return env_text
+
+    result = _FIGURE_ENV_RE.sub(_comment_figure_env, latex)
+
+    # Also handle bare \includegraphics not inside a figure environment
+    for mp in missing_paths:
+        if mp not in commented:
+            result = result.replace(
+                f"\\includegraphics",
+                f"% [missing figure] \\includegraphics",
+            )
+            commented.append(mp)
+
+    return result, commented
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
 class Pipeline:
-    """Orchestrates the 6-phase research article generation pipeline."""
+    """Orchestrates the 6-phase research article generation pipeline.
+
+    .. note:: ``_sanitize_missing_figures`` is called at multiple points to
+       prevent LLM fixes from reintroducing references to non-existent images.
+    """
 
     def __init__(
         self,
@@ -135,13 +226,15 @@ class Pipeline:
 
         # State
         self.structure_plan: StructurePlan | None = None
-        self.section_latex: dict[str, str] = {}  # section_id → polished LaTeX
-        self.pandoc_latex: dict[str, str] = {}    # section_id → raw pandoc LaTeX
-        self.source_md: dict[str, str] = {}       # section_id → raw markdown
-        self.full_latex: str = ""
+        self.section_latex: dict[str, str] = {}  # section_id -> polished LaTeX
+        self.pandoc_latex: dict[str, str] = {}    # section_id -> raw pandoc LaTeX
+        self.source_md: dict[str, str] = {}       # section_id -> raw markdown
+        self.section_reviews: dict[str, SectionReviewResult] = {}  # section_id -> review result
         self.compilation_result: CompilationResult | None = None
         self.faithfulness_report: FaithfulnessReport | None = None
         self.split_decision: SplitDecision | None = None
+        self.supplementary_plan: SupplementaryPlan | None = None
+        self.supplementary_compilation: CompilationResult | None = None
         self.manifest: BuildManifest | None = None
 
     # -----------------------------------------------------------------------
@@ -217,15 +310,51 @@ class Pipeline:
         return plan
 
     # -----------------------------------------------------------------------
-    # Phase 2: Conversion
+    # Phase 2: Conversion (with per-section review)
     # -----------------------------------------------------------------------
 
+    def _review_section(
+        self,
+        section_id: str,
+        section_latex: str,
+        orchestrator: autogen.UserProxyAgent,
+    ) -> list[ReviewFeedback]:
+        """Run 3 reviewers on a single section via direct chat."""
+        reviewers = make_reviewers(self.config)
+        collected: list[ReviewFeedback] = []
+
+        for name, agent in reviewers.items():
+            if agent is None:
+                continue
+            self.callbacks.on_section_review(section_id, name)
+            try:
+                response = orchestrator.initiate_chat(
+                    agent,
+                    message=(
+                        f"Review this LaTeX section (section_id: {section_id}):\n\n"
+                        f"{section_latex}"
+                    ),
+                    max_turns=1,
+                )
+                text = _extract_latex(response)
+                # Try to parse as ReviewFeedback
+                from .agents.reviewers import validate_review
+                feedback, err = validate_review(text)
+                if feedback:
+                    collected.append(feedback)
+                elif err:
+                    logger.warning("Could not parse review from %s: %s", name, err)
+            except Exception as e:
+                self.callbacks.on_warning(f"Reviewer {name} skipped for {section_id}: {e}")
+
+        return collected
+
     def run_conversion(self) -> dict[str, str]:
-        """Phase 2: Convert each section via Pandoc + LLM polish."""
+        """Phase 2: Convert each section via Pandoc + LLM polish + per-section review."""
         if not self.structure_plan:
             raise RuntimeError("Must run planning phase first")
 
-        self.callbacks.on_phase_start("CONVERSION", "Converting sections to LaTeX")
+        self.callbacks.on_phase_start("CONVERSION", "Converting sections to LaTeX (with per-section review)")
 
         assembler = make_assembler(self.config)
         orchestrator = autogen.UserProxyAgent(
@@ -256,6 +385,10 @@ class Pipeline:
             pandoc_latex = convert_markdown_to_latex(source_path, annotate=True)
             self.pandoc_latex[section.section_id] = pandoc_latex
 
+            # Read source markdown for faithfulness
+            if section.section_id not in self.source_md:
+                self.source_md[section.section_id] = source_path.read_text(encoding="utf-8")
+
             # Step 2: LLM polish
             prompt = (
                 f"Polish this Pandoc-converted LaTeX for the section '{section.title}'. "
@@ -271,28 +404,135 @@ class Pipeline:
             )
 
             polished = _extract_latex(response)
+
+            # Step 3: Per-section review (3 reviewers)
+            reviews = self._review_section(section.section_id, polished, orchestrator)
+
+            # Step 4: If reviews found issues, ask a fresh assembler to fix
+            fix_applied = False
+            has_issues = any(
+                r.severity in (Severity.ERROR, Severity.CRITICAL) or "fix" in r.Review.lower()
+                for r in reviews
+            )
+            if reviews and has_issues:
+                feedback_text = "\n".join(
+                    f"[{r.Reviewer}]: {r.Review}" for r in reviews
+                )
+                fix_assembler = make_assembler(self.config)
+                fix_response = orchestrator.initiate_chat(
+                    fix_assembler,
+                    message=(
+                        f"Apply the following reviewer feedback to improve this LaTeX section. "
+                        f"Return the COMPLETE corrected section.\n\n"
+                        f"FEEDBACK:\n{feedback_text}\n\n"
+                        f"SECTION:\n{polished}"
+                    ),
+                    max_turns=1,
+                )
+                new_latex = _extract_latex(fix_response)
+                if new_latex and _looks_like_latex(new_latex):
+                    polished = new_latex
+                    fix_applied = True
+
+            # Step 5: Per-section faithfulness check (deterministic)
+            section_faith = run_faithfulness_check(
+                self.source_md[section.section_id],
+                pandoc_latex,
+                polished,
+            )
+
+            # Store results
             self.section_latex[section.section_id] = polished
+            self.section_reviews[section.section_id] = SectionReviewResult(
+                section_id=section.section_id,
+                reviews=reviews,
+                faithfulness=section_faith,
+                fix_applied=fix_applied,
+            )
+
             self.callbacks.on_section_end(section.section_id)
+
+        # Aggregate faithfulness across all sections
+        self.faithfulness_report = self._aggregate_faithfulness()
 
         self.callbacks.on_phase_end("CONVERSION", len(self.section_latex) > 0)
         return self.section_latex
 
     # -----------------------------------------------------------------------
-    # Phase 3: Post-processing
+    # Phase 3: Post-processing (per-section + multi-file assembly)
     # -----------------------------------------------------------------------
 
-    def run_post_processing(self) -> str:
-        """Phase 3: Equation, figure, and citation passes + assembly."""
-        self.callbacks.on_phase_start("POST_PROCESSING", "Equation, figure, and citation passes")
+    def run_post_processing(self) -> dict[str, str]:
+        """Phase 3: Per-section equation/figure/citation passes + multi-file assembly."""
+        self.callbacks.on_phase_start("POST_PROCESSING", "Per-section post-processing + multi-file assembly")
 
-        # Assemble full document first
-        preamble = generate_preamble(self.config)
-        sections = [
-            (sid, latex)
-            for sid, latex in self.section_latex.items()
-        ]
+        orchestrator = autogen.UserProxyAgent(
+            name="Orchestrator",
+            human_input_mode="NEVER",
+            code_execution_config=False,
+        )
 
-        # Handle abstract if present
+        bib_content = ""
+        if self.bib_file and self.bib_file.exists():
+            bib_content = self.bib_file.read_text(encoding="utf-8")
+
+        for section_id, latex in list(self.section_latex.items()):
+            self.callbacks.on_section_start(section_id)
+
+            # Equation formatting pass
+            try:
+                eq_formatter = make_equation_formatter(self.config)
+                response = orchestrator.initiate_chat(
+                    eq_formatter,
+                    message=f"Check and fix equation consistency in this section:\n\n{latex}",
+                    max_turns=1,
+                )
+                updated = _extract_latex(response)
+                if updated and _looks_like_latex(updated):
+                    latex = updated
+            except Exception as e:
+                self.callbacks.on_warning(f"EquationFormatter skipped for {section_id}: {e}")
+
+            # Figure integration pass
+            try:
+                fig_integrator = make_figure_integrator(self.config)
+                response = orchestrator.initiate_chat(
+                    fig_integrator,
+                    message=f"Optimize figure placement and sizing in this section:\n\n{latex}",
+                    max_turns=1,
+                )
+                updated = _extract_latex(response)
+                if updated and _looks_like_latex(updated):
+                    latex = updated
+            except Exception as e:
+                self.callbacks.on_warning(f"FigureIntegrator skipped for {section_id}: {e}")
+
+            # Citation validation (report only, per section)
+            if bib_content:
+                try:
+                    citation_agent = make_citation_agent(self.config)
+                    orchestrator.initiate_chat(
+                        citation_agent,
+                        message=(
+                            f"Validate citations in this LaTeX section against the .bib file.\n\n"
+                            f"LaTeX:\n{latex}\n\n"
+                            f".bib contents:\n{bib_content}"
+                        ),
+                        max_turns=1,
+                    )
+                except Exception as e:
+                    self.callbacks.on_warning(f"CitationAgent skipped for {section_id}: {e}")
+
+            self.section_latex[section_id] = latex
+            self.callbacks.on_section_end(section_id)
+
+        # Multi-file assembly: write sections/*.tex + main.tex skeleton
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        write_section_files(self.section_latex, self.output_dir)
+
+        # Build main.tex skeleton
+        section_ids = list(self.section_latex.keys())
+
         abstract = None
         if self.structure_plan and self.structure_plan.abstract_file:
             abs_path = self.config_dir / self.structure_plan.abstract_file
@@ -303,73 +543,42 @@ class Pipeline:
         if self.bib_file:
             bib_name = self.bib_file.stem
 
-        self.full_latex = assemble_document(
+        preamble = generate_preamble(self.config)
+        main_tex_content = assemble_main_tex(
             preamble,
-            sections,
+            section_ids,
             abstract=abstract,
             bibliography=bib_name,
             bib_style=self.config.bib_style,
         )
-
-        orchestrator = autogen.UserProxyAgent(
-            name="Orchestrator",
-            human_input_mode="NEVER",
-            code_execution_config=False,
-        )
-
-        # Equation formatting pass
-        eq_formatter = make_equation_formatter(self.config)
-        response = orchestrator.initiate_chat(
-            eq_formatter,
-            message=f"Check and fix equation consistency:\n\n{self.full_latex}",
-            max_turns=1,
-        )
-        self.full_latex = _extract_latex(response)
-
-        # Figure integration pass
-        fig_integrator = make_figure_integrator(self.config)
-        response = orchestrator.initiate_chat(
-            fig_integrator,
-            message=f"Optimize figure placement and sizing:\n\n{self.full_latex}",
-            max_turns=1,
-        )
-        self.full_latex = _extract_latex(response)
-
-        # Citation validation
-        if self.bib_file and self.bib_file.exists():
-            bib_content = self.bib_file.read_text(encoding="utf-8")
-            citation_agent = make_citation_agent(self.config)
-            response = orchestrator.initiate_chat(
-                citation_agent,
-                message=(
-                    f"Validate citations in this LaTeX against the .bib file.\n\n"
-                    f"LaTeX:\n{self.full_latex}\n\n"
-                    f".bib contents:\n{bib_content}"
-                ),
-                max_turns=1,
-            )
-            # Citation agent only reports — doesn't modify
+        write_main_tex(main_tex_content, self.output_dir)
 
         self.callbacks.on_phase_end("POST_PROCESSING", True)
-        return self.full_latex
+        return self.section_latex
 
     # -----------------------------------------------------------------------
-    # Phase 4: Compilation + Review
+    # Phase 4: Compilation + Meta-Review
     # -----------------------------------------------------------------------
 
     def run_compilation_review(self) -> CompilationResult:
-        """Phase 4: Compile, lint, review, fix loop."""
-        self.callbacks.on_phase_start("COMPILATION_REVIEW", "Compiling and reviewing")
+        """Phase 4: Compile, meta-review on summaries, fix affected sections."""
+        self.callbacks.on_phase_start("COMPILATION_REVIEW", "Compiling and meta-reviewing")
 
         # Prepare output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy figures
         if self.figure_dir.exists():
+            fig_dest = self.output_dir / "figures"
+            fig_dest.mkdir(parents=True, exist_ok=True)
             for fig in _list_figure_files(self.figure_dir):
-                dest = self.output_dir / fig.name
+                dest = fig_dest / fig.name
                 if not dest.exists():
                     shutil.copy2(fig, dest)
+                # Also copy to output root for backward compat
+                root_dest = self.output_dir / fig.name
+                if not root_dest.exists():
+                    shutil.copy2(fig, root_dest)
 
         # Copy .bib file
         if self.bib_file and self.bib_file.exists():
@@ -380,6 +589,10 @@ class Pipeline:
         # Write Makefile
         write_makefile(generate_makefile(self.config), self.output_dir)
 
+        # Pre-compilation: comment out references to missing figure files
+        if self._sanitize_missing_figures():
+            write_section_files(self.section_latex, self.output_dir)
+
         # Compile-fix loop
         assembler = make_assembler(self.config)
         orchestrator = autogen.UserProxyAgent(
@@ -388,33 +601,70 @@ class Pipeline:
             code_execution_config=False,
         )
 
-        latex_content = self.full_latex
         result = CompilationResult(success=False, errors=[], warnings=[])
 
         for attempt in range(1, self.config.compile_max_attempts + 1):
             self.callbacks.on_compile_attempt(attempt, self.config.compile_max_attempts)
 
-            write_main_tex(latex_content, self.output_dir)
             result = run_latexmk(self.output_dir, self.config.latex_engine)
 
-            if result.success and not result.unresolved_refs:
+            if result.success:
+                if result.unresolved_refs:
+                    self.callbacks.on_warning(
+                        f"Unresolved references (will not block): {', '.join(result.unresolved_refs)}"
+                    )
+                break
+
+            # Don't try LLM fixes for environment/tooling errors
+            _unfixable = {"latexmk not found", "not found on PATH", "timed out"}
+            if any(
+                any(u in err.message for u in _unfixable)
+                for err in result.errors
+            ):
+                self.callbacks.on_warning(
+                    "Compilation failed due to environment issue (not a LaTeX content error), skipping fix attempts"
+                )
                 break
 
             if attempt < self.config.compile_max_attempts:
-                # Extract error context and ask LLM to fix
-                error_ctx = extract_error_context(result, latex_content)
-                response = orchestrator.initiate_chat(
-                    assembler,
-                    message=(
-                        f"The LaTeX compilation failed. Fix the errors below and return "
-                        f"the COMPLETE corrected LaTeX document.\n\n{error_ctx}\n\n"
-                        f"Current document:\n{latex_content}"
-                    ),
-                    max_turns=1,
-                )
-                latex_content = _extract_latex(response)
+                # Identify which section files are affected by errors
+                affected = self._identify_affected_sections(result)
+                if not affected:
+                    # Can't identify — try fixing all sections
+                    affected = list(self.section_latex.keys())
 
-        self.full_latex = latex_content
+                for section_id in affected:
+                    if section_id not in self.section_latex:
+                        continue
+                    section_content = self.section_latex[section_id]
+                    error_ctx = extract_error_context(
+                        result, section_content,
+                        section_file=f"sections/{section_id}.tex",
+                    )
+                    try:
+                        fix_response = orchestrator.initiate_chat(
+                            assembler,
+                            message=(
+                                f"The LaTeX compilation failed. Fix the errors in this section "
+                                f"and return the COMPLETE corrected section.\n\n"
+                                f"Section: {section_id}\n"
+                                f"Errors:\n{error_ctx}\n\n"
+                                f"Section content:\n{section_content}"
+                            ),
+                            max_turns=1,
+                        )
+                        new_latex = _extract_latex(fix_response)
+                        if new_latex and _looks_like_latex(new_latex):
+                            self.section_latex[section_id] = new_latex
+                    except Exception as e:
+                        self.callbacks.on_warning(f"Compile-fix skipped for {section_id}: {e}")
+
+                # Re-sanitize: LLM fixes may reintroduce missing figures
+                self._sanitize_missing_figures()
+
+                # Rewrite fixed sections and recompile
+                write_section_files(self.section_latex, self.output_dir)
+
         self.compilation_result = result
 
         # Run linter
@@ -424,64 +674,88 @@ class Pipeline:
             if lint_result.total > 0:
                 self.callbacks.on_warning(f"Lint: {lint_result.warning_count} warnings, {lint_result.error_count} errors")
 
-        # Run faithfulness check (deterministic layers 1-4)
-        all_source_md = "\n\n".join(self.source_md.values())
-        all_pandoc_latex = "\n\n".join(self.pandoc_latex.values())
-        self.faithfulness_report = run_faithfulness_check(
-            all_source_md, all_pandoc_latex, latex_content,
-        )
+        # Meta-review round: review SUMMARIES, not full doc.
+        # Snapshot the working state so we can revert if meta-review
+        # changes break compilation.
+        pre_meta_sections: dict[str, str] = {}
+        pre_meta_result = result  # from compile-fix loop
 
-        if not self.faithfulness_report.passed:
-            self.callbacks.on_warning(
-                f"Faithfulness check: {len(self.faithfulness_report.violations)} violations"
-            )
-
-        # Review round (nested chats with reviewers)
         for round_num in range(1, self.config.review_max_rounds + 1):
             self.callbacks.on_review_round(round_num, self.config.review_max_rounds)
 
-            reviewers = make_reviewers(self.config)
-            meta = make_meta_reviewer(self.config)
-            summary_args = build_summary_args()
+            # Build section summaries for meta-reviewer
+            summaries = self._build_section_summaries()
 
-            review_chats: list[dict] = []
-            for name, agent in reviewers.items():
-                if agent is not None:
-                    review_chats.append({
-                        "recipient": agent,
-                        "message": reflection_message,
-                        "summary_method": "reflection_with_llm",
-                        "summary_args": summary_args,
-                        "max_turns": self.config.review_max_turns,
-                    })
-            review_chats.append({
-                "recipient": meta,
-                "message": "Aggregate all reviewer feedback. Prioritize faithfulness issues.",
-                "max_turns": self.config.review_max_turns,
-            })
+            try:
+                meta = make_meta_reviewer(self.config)
+                review_response = orchestrator.initiate_chat(
+                    meta,
+                    message=(
+                        f"Review these section summaries for cross-section issues "
+                        f"(narrative flow, notation consistency, bibliography coherence, redundancy).\n\n"
+                        f"Prior per-section review results are included.\n\n"
+                        f"{summaries}"
+                    ),
+                    max_turns=1,
+                )
 
-            # Use assembler as trigger for nested reviews
-            review_agent = make_assembler(self.config)
-            review_agent.register_nested_chats(review_chats, trigger=orchestrator)
+                feedback = _extract_latex(review_response)
+            except Exception as e:
+                self.callbacks.on_warning(f"Meta-review skipped: {e}")
+                break
 
-            response = orchestrator.initiate_chat(
-                review_agent,
-                message=f"Review and improve this LaTeX:\n\n{latex_content}",
-                max_turns=2,
-            )
+            # Parse affected sections from meta-reviewer feedback
+            affected = self._parse_affected_sections(feedback)
+            if not affected:
+                # No cross-section issues found
+                break
 
-            new_latex = _extract_latex(response)
-            if new_latex and new_latex != latex_content:
-                latex_content = new_latex
-                self.full_latex = latex_content
+            # Save snapshot before applying meta-review changes
+            pre_meta_sections = {k: v for k, v in self.section_latex.items()}
 
-                # Recompile after fixes
-                write_main_tex(latex_content, self.output_dir)
-                result = run_latexmk(self.output_dir, self.config.latex_engine)
+            # Fix affected sections
+            for section_id in affected:
+                if section_id not in self.section_latex:
+                    continue
+                try:
+                    fix_assembler = make_assembler(self.config)
+                    fix_response = orchestrator.initiate_chat(
+                        fix_assembler,
+                        message=(
+                            f"Apply the following meta-reviewer feedback to improve this section. "
+                            f"Return the COMPLETE corrected section.\n\n"
+                            f"FEEDBACK:\n{feedback}\n\n"
+                            f"SECTION ({section_id}):\n{self.section_latex[section_id]}"
+                        ),
+                        max_turns=1,
+                    )
+                    new_latex = _extract_latex(fix_response)
+                    if new_latex and _looks_like_latex(new_latex):
+                        self.section_latex[section_id] = new_latex
+                except Exception as e:
+                    self.callbacks.on_warning(f"Meta-review fix skipped for {section_id}: {e}")
+
+            # Re-sanitize: LLM meta-review fixes may reintroduce missing figures
+            self._sanitize_missing_figures()
+
+            # Rewrite and recompile
+            write_section_files(self.section_latex, self.output_dir)
+            result = run_latexmk(self.output_dir, self.config.latex_engine)
+            self.compilation_result = result
+
+            if result.success:
+                break
+
+            # Meta-review broke compilation — revert to pre-meta-review state
+            if pre_meta_result.success and pre_meta_sections:
+                self.callbacks.on_warning(
+                    "Meta-review changes broke compilation; reverting to working state"
+                )
+                self.section_latex = pre_meta_sections
+                write_section_files(self.section_latex, self.output_dir)
+                result = pre_meta_result
                 self.compilation_result = result
-
-                if result.success:
-                    break
+                break
 
         self.callbacks.on_phase_end("COMPILATION_REVIEW", result.success)
         return result
@@ -490,8 +764,20 @@ class Pipeline:
     # Phase 5: Page Budget
     # -----------------------------------------------------------------------
 
+    def _is_supplementary_enabled(self, page_count: int) -> bool:
+        """Determine whether supplementary generation should be activated."""
+        mode = self.config.supplementary_mode
+        if mode == "disabled":
+            return False
+        if mode in ("appendix", "standalone"):
+            return True
+        if mode == "auto" and self.config.page_budget:
+            ratio = page_count / self.config.page_budget if self.config.page_budget else 0
+            return ratio > self.config.supplementary_threshold
+        return False
+
     def run_page_budget(self) -> SplitDecision | None:
-        """Phase 5: Advisory page budget analysis."""
+        """Phase 5: Advisory page budget analysis (with optional supplementary split)."""
         self.callbacks.on_phase_start("PAGE_BUDGET", "Checking page budget")
 
         if not self.config.page_budget:
@@ -517,8 +803,13 @@ class Pipeline:
             self.callbacks.on_phase_end("PAGE_BUDGET", True)
             return decision
 
-        # Over budget — ask LLM for advisory
-        budget_mgr = make_page_budget_manager(self.config)
+        # Over budget — decide if supplementary mode is active
+        supplementary_enabled = self._is_supplementary_enabled(page_count)
+
+        budget_mgr = make_page_budget_manager(
+            self.config,
+            supplementary_enabled=supplementary_enabled,
+        )
         orchestrator = autogen.UserProxyAgent(
             name="Orchestrator",
             human_input_mode="NEVER",
@@ -530,24 +821,43 @@ class Pipeline:
             for s in self.structure_plan.sections:
                 sections_info += f"  - {s.section_id}: ~{s.estimated_pages} pages (priority {s.priority})\n"
 
+        supp_note = ""
+        if supplementary_enabled:
+            mode = self.config.supplementary_mode
+            if mode == "auto":
+                mode = "standalone"
+            supp_note = (
+                f"\nSupplementary mode: {mode}. "
+                f"Classify each section and produce a supplementary_plan."
+            )
+
         response = orchestrator.initiate_chat(
             budget_mgr,
             message=(
                 f"The document is {page_count} pages but the budget is {self.config.page_budget} pages.\n"
                 f"Sections:\n{sections_info}\n"
                 f"Recommend which sections/figures to move to supplementary materials."
+                f"{supp_note}"
             ),
             max_turns=1,
         )
 
         decision = _extract_json(response, SplitDecision)
         if decision is None:
+            action = "warn_over"
             decision = SplitDecision(
-                action="warn_over",
+                action=action,
                 current_pages=page_count,
                 budget_pages=self.config.page_budget,
                 recommendations=f"Document is {page_count} pages, over budget of {self.config.page_budget}.",
             )
+
+        # Store supplementary plan if the decision includes one
+        if decision.supplementary_plan and decision.action == "split":
+            # Override mode from config if explicit (not auto)
+            if self.config.supplementary_mode in ("appendix", "standalone"):
+                decision.supplementary_plan.mode = self.config.supplementary_mode
+            self.supplementary_plan = decision.supplementary_plan
 
         self.split_decision = decision
         if decision.action != "ok":
@@ -555,6 +865,164 @@ class Pipeline:
 
         self.callbacks.on_phase_end("PAGE_BUDGET", True)
         return decision
+
+    # -----------------------------------------------------------------------
+    # Phase 5b: Supplementary Materials
+    # -----------------------------------------------------------------------
+
+    def run_supplementary(self) -> SupplementaryPlan | None:
+        """Phase 5b: Generate supplementary materials if a plan exists."""
+        if self.supplementary_plan is None:
+            return None
+
+        self.callbacks.on_phase_start("SUPPLEMENTARY", "Generating supplementary materials")
+        plan = self.supplementary_plan
+
+        if plan.mode == "appendix":
+            self._rebuild_main_with_appendix(plan)
+        else:
+            self._generate_standalone_supplementary(plan)
+
+        # Insert cross-reference note in last main section
+        self._insert_supplementary_note(plan)
+
+        # Rewrite all section files
+        write_section_files(self.section_latex, self.output_dir)
+
+        # Recompile main.tex
+        result = run_latexmk(self.output_dir, self.config.latex_engine)
+        self.compilation_result = result
+
+        # Compile supplementary.tex if standalone
+        if plan.mode == "standalone":
+            supp_result = self._compile_fix_supplementary()
+            self.supplementary_compilation = supp_result
+
+        self.callbacks.on_phase_end("SUPPLEMENTARY", True)
+        return plan
+
+    def _rebuild_main_with_appendix(self, plan: SupplementaryPlan) -> None:
+        """Rebuild main.tex with supplementary sections as appendices."""
+        main_ids = [
+            sid for sid in self.section_latex
+            if sid not in plan.supplementary_sections
+        ]
+
+        abstract = None
+        if self.structure_plan and self.structure_plan.abstract_file:
+            abs_path = self.config_dir / self.structure_plan.abstract_file
+            if abs_path.exists():
+                abstract = convert_markdown_to_latex(abs_path, annotate=False)
+
+        bib_name = self.bib_file.stem if self.bib_file else None
+
+        preamble = generate_preamble(self.config)
+        main_tex_content = assemble_main_tex(
+            preamble,
+            main_ids,
+            abstract=abstract,
+            bibliography=bib_name,
+            bib_style=self.config.bib_style,
+            appendix_ids=plan.supplementary_sections,
+        )
+        write_main_tex(main_tex_content, self.output_dir)
+
+    def _generate_standalone_supplementary(self, plan: SupplementaryPlan) -> None:
+        """Rebuild main.tex without supp sections and generate supplementary.tex."""
+        main_ids = [
+            sid for sid in self.section_latex
+            if sid not in plan.supplementary_sections
+        ]
+
+        abstract = None
+        if self.structure_plan and self.structure_plan.abstract_file:
+            abs_path = self.config_dir / self.structure_plan.abstract_file
+            if abs_path.exists():
+                abstract = convert_markdown_to_latex(abs_path, annotate=False)
+
+        bib_name = self.bib_file.stem if self.bib_file else None
+
+        # Rebuild main.tex (without supplementary sections)
+        preamble = generate_preamble(self.config)
+        main_tex_content = assemble_main_tex(
+            preamble,
+            main_ids,
+            abstract=abstract,
+            bibliography=bib_name,
+            bib_style=self.config.bib_style,
+        )
+        write_main_tex(main_tex_content, self.output_dir)
+
+        # Generate supplementary.tex
+        supp_content = assemble_supplementary_tex(
+            preamble,
+            plan.supplementary_sections,
+            project_name=self.config.project_name,
+            bibliography=bib_name,
+            bib_style=self.config.bib_style,
+        )
+        write_supplementary_tex(supp_content, self.output_dir)
+
+    def _insert_supplementary_note(self, plan: SupplementaryPlan) -> None:
+        """Append a supplementary materials note to the last main section."""
+        main_ids = [
+            sid for sid in self.section_latex
+            if sid not in plan.supplementary_sections
+        ]
+        if not main_ids:
+            return
+
+        last_main_id = main_ids[-1]
+        note = (
+            f"\n\n\\paragraph{{Supplementary Materials.}}\n"
+            f"{plan.cross_reference_note}\n"
+        )
+        self.section_latex[last_main_id] += note
+
+    def _compile_fix_supplementary(self) -> CompilationResult:
+        """Compile supplementary.tex with a simple compile-fix loop."""
+        result = run_latexmk(
+            self.output_dir,
+            self.config.latex_engine,
+            main_file="supplementary.tex",
+        )
+
+        if not result.success:
+            # One retry: try to fix errors via LLM
+            assembler = make_assembler(self.config)
+            orchestrator = autogen.UserProxyAgent(
+                name="Orchestrator",
+                human_input_mode="NEVER",
+                code_execution_config=False,
+            )
+
+            supp_path = self.output_dir / "supplementary.tex"
+            if supp_path.exists():
+                supp_content = supp_path.read_text(encoding="utf-8")
+                error_ctx = extract_error_context(result, supp_content)
+                try:
+                    fix_response = orchestrator.initiate_chat(
+                        assembler,
+                        message=(
+                            f"The supplementary LaTeX compilation failed. "
+                            f"Fix the errors and return the COMPLETE corrected document.\n\n"
+                            f"Errors:\n{error_ctx}\n\n"
+                            f"Document:\n{supp_content}"
+                        ),
+                        max_turns=1,
+                    )
+                    new_latex = _extract_latex(fix_response)
+                    if new_latex and _looks_like_latex(new_latex):
+                        supp_path.write_text(new_latex, encoding="utf-8")
+                        result = run_latexmk(
+                            self.output_dir,
+                            self.config.latex_engine,
+                            main_file="supplementary.tex",
+                        )
+                except Exception as e:
+                    self.callbacks.on_warning(f"Supplementary compile-fix skipped: {e}")
+
+        return result
 
     # -----------------------------------------------------------------------
     # Phase 6: Finalization
@@ -570,9 +1038,29 @@ class Pipeline:
         if self.split_decision and self.split_decision.action != "ok":
             warnings.append(f"Page budget: {self.split_decision.recommendations}")
 
+        section_file_list = [f"sections/{sid}.tex" for sid in self.section_latex]
+
+        # Supplementary fields
+        supp_tex = None
+        supp_pdf = None
+        supp_sections: list[str] = []
+        has_supplementary = False
+        if self.supplementary_plan:
+            supp_sections = self.supplementary_plan.supplementary_sections
+            has_supplementary = True
+            if self.supplementary_plan.mode == "standalone":
+                supp_tex = "supplementary.tex"
+                if (
+                    self.supplementary_compilation
+                    and self.supplementary_compilation.success
+                    and self.supplementary_compilation.pdf_path
+                ):
+                    supp_pdf = self.supplementary_compilation.pdf_path
+
         self.manifest = BuildManifest(
             project_name=self.config.project_name,
             output_dir=str(self.output_dir),
+            section_files=section_file_list,
             pdf_file=self.compilation_result.pdf_path if self.compilation_result else None,
             source_files=[s.source_file for s in (self.structure_plan.sections if self.structure_plan else [])],
             figure_files=[str(f) for f in _list_figure_files(self.figure_dir)],
@@ -582,6 +1070,15 @@ class Pipeline:
             faithfulness_passed=self.faithfulness_report.passed if self.faithfulness_report else False,
             page_count=self.compilation_result.page_count if self.compilation_result else None,
             warnings=warnings,
+            supplementary_tex=supp_tex,
+            supplementary_pdf=supp_pdf,
+            supplementary_sections=supp_sections,
+        )
+
+        # Update Makefile with supplementary target if needed
+        write_makefile(
+            generate_makefile(self.config, has_supplementary=has_supplementary),
+            self.output_dir,
         )
 
         # Write manifest
@@ -620,6 +1117,9 @@ class Pipeline:
 
             self.run_page_budget()
             phases.append(PipelinePhase.PAGE_BUDGET)
+
+            self.run_supplementary()
+            phases.append(PipelinePhase.SUPPLEMENTARY)
 
             self.run_finalization()
             phases.append(PipelinePhase.FINALIZATION)
@@ -682,12 +1182,24 @@ class Pipeline:
         return run_latexmk(self.output_dir, self.config.latex_engine)
 
     def run_validate_only(self) -> FaithfulnessReport:
-        """Run faithfulness validation on existing output."""
-        tex_path = self.output_dir / "main.tex"
-        if not tex_path.exists():
-            raise FileNotFoundError(f"main.tex not found in {self.output_dir}")
+        """Run faithfulness validation on existing output.
 
-        output_latex = tex_path.read_text(encoding="utf-8")
+        Reads individual section files from sections/*.tex when available,
+        falling back to monolithic main.tex.
+        """
+        sections_dir = self.output_dir / "sections"
+
+        if sections_dir.exists() and list(sections_dir.glob("*.tex")):
+            # Multi-file: read each section individually
+            output_latex = ""
+            for tex_file in sorted(sections_dir.glob("*.tex")):
+                output_latex += tex_file.read_text(encoding="utf-8") + "\n\n"
+        else:
+            # Fallback: monolithic main.tex
+            tex_path = self.output_dir / "main.tex"
+            if not tex_path.exists():
+                raise FileNotFoundError(f"main.tex not found in {self.output_dir}")
+            output_latex = tex_path.read_text(encoding="utf-8")
 
         # Load source files
         all_source_md = ""
@@ -698,3 +1210,171 @@ class Pipeline:
             all_pandoc_latex += pandoc_latex + "\n\n"
 
         return run_faithfulness_check(all_source_md, all_pandoc_latex, output_latex)
+
+    # -----------------------------------------------------------------------
+    # Helper methods
+    # -----------------------------------------------------------------------
+
+    def _sanitize_missing_figures(self) -> bool:
+        """Comment out missing-figure references across all sections.
+
+        Iterates ``self.section_latex``, applies ``_comment_missing_figures``
+        on each, and updates in-place.  Does **not** write files — callers
+        handle that.
+
+        Returns ``True`` if any section was modified.
+        """
+        changed = False
+        for section_id, latex in list(self.section_latex.items()):
+            fixed, commented_paths = _comment_missing_figures(latex, self.output_dir)
+            if commented_paths:
+                self.callbacks.on_warning(
+                    f"Section {section_id}: commented out missing figure(s): {', '.join(commented_paths)}"
+                )
+                self.section_latex[section_id] = fixed
+                changed = True
+        return changed
+
+    def _aggregate_faithfulness(self) -> FaithfulnessReport:
+        """Combine per-section faithfulness reports into one aggregate report."""
+        all_violations: list[FaithfulnessViolation] = []
+        section_match = True
+        math_match = True
+        citation_match = True
+        figure_match = True
+
+        for sid, review in self.section_reviews.items():
+            if review.faithfulness is None:
+                continue
+            all_violations.extend(review.faithfulness.violations)
+            if not review.faithfulness.section_match:
+                section_match = False
+            if not review.faithfulness.math_match:
+                math_match = False
+            if not review.faithfulness.citation_match:
+                citation_match = False
+            if not review.faithfulness.figure_match:
+                figure_match = False
+
+        passed = not any(
+            v.severity in (Severity.CRITICAL, Severity.ERROR)
+            for v in all_violations
+        )
+
+        return FaithfulnessReport(
+            passed=passed,
+            violations=all_violations,
+            section_match=section_match,
+            math_match=math_match,
+            citation_match=citation_match,
+            figure_match=figure_match,
+        )
+
+    def _build_section_summaries(self) -> str:
+        """Build truncated summaries of each section for the meta-reviewer.
+
+        Each summary includes: first 20 lines, last 10 lines, stats, and
+        prior review results.
+        """
+        parts: list[str] = []
+
+        for section_id, latex in self.section_latex.items():
+            lines = latex.splitlines()
+            total_lines = len(lines)
+
+            # First 20 + last 10 lines
+            head = "\n".join(lines[:20])
+            tail = "\n".join(lines[-10:]) if total_lines > 30 else ""
+
+            # Stats
+            eq_count = latex.count("\\begin{equation")
+            fig_count = latex.count("\\includegraphics")
+            cite_count = len(re.findall(r"\\cite[tp]?\{", latex))
+
+            summary = f"=== Section: {section_id} ({total_lines} lines) ===\n"
+            summary += f"Stats: {eq_count} equations, {fig_count} figures, {cite_count} citations\n"
+
+            # Prior review results
+            if section_id in self.section_reviews:
+                sr = self.section_reviews[section_id]
+                for r in sr.reviews:
+                    summary += f"  [{r.Reviewer}]: {r.Review}\n"
+                if sr.faithfulness and not sr.faithfulness.passed:
+                    summary += f"  [Faithfulness]: FAILED ({len(sr.faithfulness.violations)} violations)\n"
+                if sr.fix_applied:
+                    summary += "  [Fix]: Applied after review\n"
+
+            summary += f"\n--- Head (first 20 lines) ---\n{head}\n"
+            if tail:
+                summary += f"\n--- Tail (last 10 lines) ---\n{tail}\n"
+
+            parts.append(summary)
+
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _parse_affected_sections(feedback: str) -> list[str]:
+        """Extract section_ids from meta-reviewer feedback text.
+
+        Looks for patterns like: "section_id": "02_methodology" or
+        "section_id": "02_methodology, 03_results" (comma-separated) or
+        section_id: 02_methodology (plain text).
+        """
+        affected: list[str] = []
+
+        def _add(sid: str) -> None:
+            sid = sid.strip().strip('",')
+            if sid and sid not in affected:
+                affected.append(sid)
+
+        # Pattern 1: JSON-like "section_id": "value" (may be comma-separated)
+        for m in re.finditer(r'"section_id"\s*:\s*"([^"]+)"', feedback):
+            for part in m.group(1).split(","):
+                _add(part)
+
+        # Pattern 2: section_id: value (plain text)
+        for m in re.finditer(r'section_id\s*:\s*(\S+)', feedback, re.IGNORECASE):
+            for part in m.group(1).split(","):
+                _add(part)
+
+        return affected
+
+    def _identify_affected_sections(self, result: CompilationResult) -> list[str]:
+        """Map compilation errors to section files by matching error context/message."""
+        affected: list[str] = []
+
+        for err in result.errors:
+            # Check if error mentions a section file
+            if err.file and "sections/" in err.file:
+                sid = err.file.replace("sections/", "").replace(".tex", "")
+                if sid in self.section_latex and sid not in affected:
+                    affected.append(sid)
+                continue
+
+            # Try matching error context lines against section content
+            ctx = err.context or ""
+            if ctx:
+                for section_id, latex in self.section_latex.items():
+                    for line in ctx.splitlines():
+                        cleaned = re.sub(r"^[>\s]*\d*\s*\|\s*", "", line).strip()
+                        if cleaned and len(cleaned) > 10 and cleaned in latex:
+                            if section_id not in affected:
+                                affected.append(section_id)
+                            break
+
+            # Also try matching key tokens from the error message (e.g. filenames,
+            # command names) against section content
+            msg = err.message
+            if not msg:
+                continue
+            # Extract quoted/backticked tokens from the error message
+            tokens = re.findall(r"[`']([^`']+)[`']", msg)
+            for token in tokens:
+                token = token.strip()
+                if len(token) < 4:
+                    continue
+                for section_id, latex in self.section_latex.items():
+                    if token in latex and section_id not in affected:
+                        affected.append(section_id)
+
+        return affected

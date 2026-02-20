@@ -1,0 +1,23 @@
+This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2023)
+entering extended mode
+(./main.tex
+LaTeX2e <2023-11-01> patch level 1
+(/usr/share/texlive/texmf-dist/tex/latex/elsarticle/elsarticle.cls)
+(./main.aux)
+
+! Undefined control sequence.
+l.42 \badcommand
+                 {test}
+?
+! LaTeX Error: Environment badenv undefined.
+
+See the LaTeX manual or LaTeX Companion for explanation.
+Type  H <return>  for immediate help.
+ ...
+
+l.85 \begin{badenv}
+
+LaTeX Warning: Reference `fig:missing' on page 3 undefined on input line 102.
+LaTeX Warning: Citation `nonexistent2023' on page 5 undefined on input line 145.
+
+No pages of output.

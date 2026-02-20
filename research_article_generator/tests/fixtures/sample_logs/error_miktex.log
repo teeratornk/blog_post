@@ -1,0 +1,31 @@
+This is pdfTeX, Version 3.141592653-2.6-1.40.25 (MiKTeX 24.1)
+entering extended mode
+(main.tex
+LaTeX2e <2023-11-01> patch level 1
+(C:\Users\testuser\AppData\Local\Programs\MiKTeX\tex\latex\elsarticle\elsarticle.cls)
+(main.aux)
+(sections/01_introduction.tex)
+(sections/02_methodology.tex
+
+! LaTeX Error: File `figures/convergence.png' not found.
+
+See the LaTeX manual or LaTeX Companion for explanation.
+Type  H <return>  for immediate help.
+ ...
+
+l.44 \includegraphics[width=0.9\linewidth]{figures/convergence.png}
+
+)
+(sections/03_results.tex
+
+! Undefined control sequence.
+l.22 \badcommand
+                 {value}
+?
+)
+(sections/04_conclusion.tex)
+
+LaTeX Warning: Reference `sec:methodology' on page 4 undefined on input line 88.
+
+No pages of output.
+)

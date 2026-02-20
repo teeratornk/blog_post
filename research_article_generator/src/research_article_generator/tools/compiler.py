@@ -22,9 +22,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _find_latexmk() -> str | None:
+    """Find the latexmk executable, checking both Unix and Windows (.exe) names."""
+    path = shutil.which("latexmk")
+    if path:
+        return path
+    # WSL interop: Windows .exe may be on PATH but shutil.which misses it
+    path = shutil.which("latexmk.exe")
+    return path
+
+
 def latexmk_available() -> bool:
     """Check if latexmk is on PATH."""
-    return shutil.which("latexmk") is not None
+    return _find_latexmk() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +56,68 @@ _UNDEF_CIT_RE = re.compile(
     r"LaTeX Warning: Citation `([^']+)' on page",
     re.MULTILINE,
 )
+
+# Pattern matching file-open events in LaTeX logs.
+# TeX Live uses (./sections/foo.tex; MiKTeX omits the ./ prefix.
+_FILE_OPEN_RE = re.compile(r"\((?:\./)?([^\s()]+\.tex)\b")
+
+
+def _is_absolute_path(path: str) -> bool:
+    """Return True for absolute/system paths (e.g. C:\\... or /usr/...)."""
+    if len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\"):
+        return True  # Windows drive letter, e.g. C:\...
+    if path.startswith("/"):
+        return True  # Unix absolute
+    return False
+
+
+def _find_current_file(log_text: str, error_pos: int) -> str:
+    """Determine which .tex file is active at *error_pos* in the log.
+
+    LaTeX logs track files via parenthesis nesting: ``(./path.tex ...)``.
+    We scan from the start up to *error_pos*, maintaining a filename stack.
+    Returns the innermost active file, or ``"main.tex"`` if the stack is
+    empty or only the root file is open.
+
+    Handles both TeX Live (``(./path.tex``) and MiKTeX (``(path.tex``)
+    log formats.  Absolute/system paths are ignored.
+    """
+    stack: list[str] = []
+    i = 0
+    text = log_text[:error_pos]
+
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            # Check if this opens a .tex file
+            m = _FILE_OPEN_RE.match(text, i)
+            if m:
+                fname = m.group(1)
+                # Skip absolute/system paths — not project files
+                if _is_absolute_path(fname):
+                    stack.append("")
+                    i = m.end()
+                    continue
+                # Normalise: strip leading "./"
+                fname = fname.lstrip("./")
+                stack.append(fname)
+                i = m.end()
+                continue
+            # Non-file open paren — push sentinel so ')' tracking stays balanced
+            stack.append("")
+            i += 1
+        elif ch == ")":
+            if stack:
+                stack.pop()
+            i += 1
+        else:
+            i += 1
+
+    # Walk stack from top to find the innermost real .tex file
+    for name in reversed(stack):
+        if name:
+            return name
+    return "main.tex"
 
 
 def _extract_context(tex_content: str, line_num: int, window: int = 5) -> str:
@@ -89,11 +161,18 @@ def parse_log(log_path: str | Path, tex_content: str = "") -> tuple[list[Compila
         line_match = _LINE_RE.search(after_error)
         if line_match:
             line_num = int(line_match.group(1))
-            if tex_content:
-                context = _extract_context(tex_content, line_num)
+
+        # Determine which file the error belongs to
+        err_file = _find_current_file(log_text, em.start())
+
+        # Only extract context from tex_content when the error is in main.tex
+        # (for section files, tex_content is the main.tex skeleton with \input{}
+        # lines, so line numbers won't match — context is re-extracted later)
+        if line_num and tex_content and err_file == "main.tex":
+            context = _extract_context(tex_content, line_num)
 
         errors.append(CompilationWarning(
-            file="main.tex",
+            file=err_file,
             line=line_num,
             message=error_msg,
             severity=Severity.ERROR,
@@ -105,7 +184,7 @@ def parse_log(log_path: str | Path, tex_content: str = "") -> tuple[list[Compila
         msg = wm.group(1).strip().replace("\n", " ")
         if msg:
             warnings.append(CompilationWarning(
-                file="main.tex",
+                file=_find_current_file(log_text, wm.start()),
                 message=msg,
                 severity=Severity.WARNING,
             ))
@@ -152,7 +231,8 @@ def run_latexmk(
             errors=[CompilationWarning(message=f"{main_file} not found in {out}", severity=Severity.ERROR)],
         )
 
-    if not latexmk_available():
+    latexmk_cmd = _find_latexmk()
+    if not latexmk_cmd:
         return CompilationResult(
             success=False,
             errors=[CompilationWarning(message="latexmk not found on PATH", severity=Severity.ERROR)],
@@ -165,7 +245,7 @@ def run_latexmk(
     }.get(engine, "-pdf")
 
     cmd = [
-        "latexmk",
+        latexmk_cmd,
         engine_flag,
         "-interaction=nonstopmode",
         "-halt-on-error",
@@ -194,6 +274,15 @@ def run_latexmk(
     # Parse the log file
     log_path = out / main_file.replace(".tex", ".log")
     errors, warnings, unresolved = parse_log(log_path, tex_content)
+
+    # Re-extract context for errors in section files (parse_log skips these
+    # because tex_content is the main.tex skeleton with wrong line numbers)
+    for err in errors:
+        if "sections/" in (err.file or "") and err.line:
+            section_path = out / err.file
+            if section_path.exists():
+                section_content = section_path.read_text(encoding="utf-8", errors="replace")
+                err.context = _extract_context(section_content, err.line)
 
     # Check for PDF output
     pdf_name = main_file.replace(".tex", ".pdf")
@@ -227,20 +316,47 @@ def run_latexmk(
 # ---------------------------------------------------------------------------
 
 
-def extract_error_context(result: CompilationResult, tex_content: str) -> str:
+def extract_error_context(
+    result: CompilationResult,
+    tex_content: str,
+    *,
+    section_file: str = "",
+) -> str:
     """Format compilation errors with source context for LLM fix attempts.
+
+    Parameters
+    ----------
+    result : CompilationResult
+        The compilation result containing errors.
+    tex_content : str
+        The tex source to use for context extraction (typically the section content).
+    section_file : str
+        When set (e.g. ``"sections/02_methods.tex"``), only errors from that file
+        are included and context is re-extracted from *tex_content*.
 
     Returns a human-readable string suitable as an LLM prompt.
     """
-    if not result.errors:
+    errors = result.errors
+    if section_file:
+        errors = [e for e in errors if (e.file or "") == section_file or not e.file]
+
+    if not errors and not result.unresolved_refs:
         return "No errors found."
 
     parts: list[str] = []
-    for i, err in enumerate(result.errors, 1):
+
+    if not errors:
+        parts.append("No LaTeX errors found.")
+
+    for i, err in enumerate(errors, 1):
         parts.append(f"Error {i}: {err.message}")
         if err.line:
             parts.append(f"  Line: {err.line}")
-        if err.context:
+
+        # When section_file matches, prefer re-extracting from provided tex_content
+        if section_file and err.file == section_file and err.line and tex_content:
+            parts.append(f"  Context:\n{_extract_context(tex_content, err.line)}")
+        elif err.context:
             parts.append(f"  Context:\n{err.context}")
         elif err.line and tex_content:
             parts.append(f"  Context:\n{_extract_context(tex_content, err.line)}")

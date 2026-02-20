@@ -59,6 +59,16 @@ def error_log_path() -> Path:
 
 
 @pytest.fixture
+def error_multifile_log_path() -> Path:
+    return SAMPLE_LOGS / "error_multifile.log"
+
+
+@pytest.fixture
+def error_miktex_log_path() -> Path:
+    return SAMPLE_LOGS / "error_miktex.log"
+
+
+@pytest.fixture
 def tmp_output_dir(tmp_path: Path) -> Path:
     out = tmp_path / "output"
     out.mkdir()
