@@ -33,6 +33,14 @@ Read-only zones — preserve these exactly (do not modify, reorder, or remove):
 You may only modify text between %% SAFE_ZONE_START and %% SAFE_ZONE_END markers.
 Everything outside those markers must be preserved character-for-character.
 
+Tone rule — fact-based writing:
+- All sections EXCEPT "Discussion" (and "Conclusion" subsections that interpret results)
+  must be strictly fact-based: report methods, results, and prior work without
+  subjective judgment, speculation, or opinion.
+- Remove hedging phrases ("we believe", "it seems", "arguably"), value judgments
+  ("excellent results", "remarkable improvement"), and unsupported claims.
+- The Discussion section may include interpretation, limitations, and outlook.
+
 {template_context_block}\
 Return the polished LaTeX only, without explanations or markdown fences.
 """

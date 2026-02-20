@@ -37,6 +37,9 @@ def _attempt_repair(raw: str) -> str | None:
     txt = txt.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
     txt = re.sub(r",\s*([}\]])", r"\1", txt)
     txt = re.sub(r'(?m)^(\s*)(Reviewer|Review)\s*:\s*', lambda m: f'{m.group(1)}"{m.group(2)}": ', txt)
+    # Fix unescaped backslashes (e.g. LaTeX commands like \textwidth inside JSON strings).
+    # Replace lone backslashes that aren't already valid JSON escapes.
+    txt = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', txt)
     return txt
 
 
@@ -110,11 +113,11 @@ def build_summary_args() -> dict:
 
 def _reviewer_system_message(role_desc: str, role_name: str) -> str:
     return (
-        f"You are {role_desc}. Respond ONLY with a single JSON object: "
+        f"You are {role_desc}. Respond with a single JSON object: "
         f'{{"Reviewer": "{role_name}", "Review": "- point 1; - point 2; - point 3"}}. '
-        "Rules: (1) Reviewer MUST equal your agent name exactly; "
-        "(2) Review value is ONE string containing up to 3 semicolon-separated concise actionable bullet points; "
-        "(3) No markdown fences, no lists/arrays, no extra keys, no commentary. Output nothing except that JSON object."
+        "Guidelines: (1) Reviewer must equal your agent name exactly; "
+        "(2) Review value is one string containing up to 3 semicolon-separated concise actionable bullet points; "
+        "(3) No markdown fences, no lists/arrays, no extra keys. Return that JSON object only."
     )
 
 
@@ -177,27 +180,38 @@ def make_reviewers(config: ProjectConfig) -> dict[str, autogen.AssistantAgent | 
         "StyleChecker": _maybe(
             "StyleChecker", "style_checker",
             "an academic writing style reviewer checking for clarity, conciseness, "
-            "passive voice overuse, and journal-appropriate academic tone",
+            "passive voice overuse, and journal-appropriate academic tone. "
+            "Flag any subjective opinions, value judgments, hedging phrases "
+            "(e.g. 'we believe', 'arguably', 'remarkable'), or unsupported claims "
+            "in sections other than Discussion — all non-Discussion sections must "
+            "be strictly fact-based",
             config,
         ),
         "FaithfulnessChecker": _maybe(
             "FaithfulnessChecker", "faithfulness_checker",
             "a faithfulness checker that receives diff output from deterministic checks "
             "and evaluates whether any meaning-altering changes were made. "
-            "You are the HARD GATE — flag any content that differs from the source material",
+            "Flag any content that differs from the source material",
             config,
         ),
     }
 
 
 def make_meta_reviewer(config: ProjectConfig) -> autogen.AssistantAgent:
-    """Create the MetaReviewer that aggregates feedback."""
+    """Create the MetaReviewer that aggregates cross-section feedback."""
     return autogen.AssistantAgent(
         name="MetaReviewer",
         llm_config=build_role_llm_config("meta_reviewer", config),
         system_message=(
-            "You are a meta reviewer for a research article LaTeX pipeline. "
-            "Aggregate other reviewers' feedback and give final suggestions. "
+            "You are a meta reviewer for a multi-file research article LaTeX pipeline. "
+            "You receive per-section review summaries (NOT the full document). "
+            "Focus on CROSS-SECTION issues:\n"
+            "1. Narrative flow — do sections connect logically?\n"
+            "2. Notation consistency — are symbols/variables defined once and used consistently?\n"
+            "3. Bibliography coherence — are citations used consistently across sections?\n"
+            "4. Redundancy — is content repeated across sections?\n"
+            "For every issue, specify the affected section_id(s) so fixes can be targeted. "
+            "Format: {\"section_id\": \"<id>\", \"issue\": \"<description>\", \"severity\": \"<warning|error|critical>\"}. "
             "Prioritize faithfulness issues as CRITICAL."
         ),
     )
