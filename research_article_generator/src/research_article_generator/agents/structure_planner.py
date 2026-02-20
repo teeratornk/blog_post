@@ -19,12 +19,13 @@ For each section, determine:
 - Which figures and tables belong to that section
 - Estimated page count
 
+{template_context_block}\
 Output ONLY a valid JSON object matching the StructurePlan schema:
-{
+{{
   "title": "Article Title",
   "abstract_file": "path or null",
   "sections": [
-    {
+    {{
       "section_id": "01_introduction",
       "title": "Introduction",
       "source_file": "drafts/01_introduction.md",
@@ -34,21 +35,34 @@ Output ONLY a valid JSON object matching the StructurePlan schema:
       "equations": 0,
       "estimated_pages": 1.5,
       "priority": 1
-    }
+    }}
   ],
   "bibliography_file": "references.bib",
   "total_estimated_pages": 12.0,
   "page_budget": 15,
   "budget_status": "ok"
-}
+}}
 """
 
 
-def make_structure_planner(config: ProjectConfig) -> autogen.AssistantAgent:
+def make_structure_planner(
+    config: ProjectConfig,
+    *,
+    template_context: str = "",
+) -> autogen.AssistantAgent:
     """Create the StructurePlanner agent."""
+    if template_context:
+        block = (
+            "The target journal template is shown below. Adapt the document structure\n"
+            "to match its conventions (e.g., use frontmatter sections if required).\n\n"
+            f"{template_context}\n\n"
+        )
+    else:
+        block = ""
+
     agent = autogen.AssistantAgent(
         name="StructurePlanner",
-        system_message=SYSTEM_PROMPT,
+        system_message=SYSTEM_PROMPT.format(template_context_block=block),
         llm_config=build_role_llm_config("planner", config),
     )
     # Enforce structured output

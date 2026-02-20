@@ -53,6 +53,7 @@ from .tools.latex_builder import (
     assemble_supplementary_tex,
     generate_makefile,
     generate_preamble,
+    summarize_template,
     write_main_tex,
     write_makefile,
     write_section_files,
@@ -225,6 +226,9 @@ class Pipeline:
         self.output_dir = self.config_dir / config.output_dir
         self.bib_file = (self.config_dir / config.bibliography) if config.bibliography else None
 
+        # Template context (loaded once, passed to planner + assembler agents)
+        self.template_context: str = summarize_template(self.config)
+
         # State
         self.structure_plan: StructurePlan | None = None
         self.section_latex: dict[str, str] = {}  # section_id -> polished LaTeX
@@ -274,7 +278,7 @@ class Pipeline:
             input_desc += f"\nBibliography: {self.bib_file.name}\n"
 
         # Use AG2 agent
-        planner = make_structure_planner(self.config)
+        planner = make_structure_planner(self.config, template_context=self.template_context)
         orchestrator = autogen.UserProxyAgent(
             name="Orchestrator",
             human_input_mode="NEVER",
@@ -357,7 +361,7 @@ class Pipeline:
 
         self.callbacks.on_phase_start("CONVERSION", "Converting sections to LaTeX (with per-section review)")
 
-        assembler = make_assembler(self.config)
+        assembler = make_assembler(self.config, template_context=self.template_context)
         orchestrator = autogen.UserProxyAgent(
             name="Orchestrator",
             human_input_mode="NEVER",
@@ -393,7 +397,6 @@ class Pipeline:
             # Step 2: LLM polish
             prompt = (
                 f"Polish this Pandoc-converted LaTeX for the section '{section.title}'. "
-                f"Template: {self.config.template}. "
                 f"Only modify text between SAFE_ZONE markers.\n\n"
                 f"{pandoc_latex}"
             )
@@ -419,7 +422,7 @@ class Pipeline:
                 feedback_text = "\n".join(
                     f"[{r.Reviewer}]: {r.Review}" for r in reviews
                 )
-                fix_assembler = make_assembler(self.config)
+                fix_assembler = make_assembler(self.config, template_context=self.template_context)
                 fix_response = orchestrator.initiate_chat(
                     fix_assembler,
                     message=(
@@ -599,7 +602,7 @@ class Pipeline:
             write_section_files(self.section_latex, self.output_dir)
 
         # Compile-fix loop
-        assembler = make_assembler(self.config)
+        assembler = make_assembler(self.config, template_context=self.template_context)
         orchestrator = autogen.UserProxyAgent(
             name="Orchestrator",
             human_input_mode="NEVER",
@@ -659,7 +662,8 @@ class Pipeline:
                             assembler,
                             message=(
                                 f"The LaTeX compilation failed. Fix the errors in this section "
-                                f"and return the COMPLETE corrected section.\n\n"
+                                f"and return the COMPLETE corrected section.\n"
+                                f"Do NOT add \\usepackage commands — the preamble is fixed.\n\n"
                                 f"Section: {section_id}\n"
                                 f"Errors:\n{error_ctx}\n\n"
                                 f"Section content:\n{section_content}"
@@ -731,7 +735,7 @@ class Pipeline:
                 if section_id not in self.section_latex:
                     continue
                 try:
-                    fix_assembler = make_assembler(self.config)
+                    fix_assembler = make_assembler(self.config, template_context=self.template_context)
                     fix_response = orchestrator.initiate_chat(
                         fix_assembler,
                         message=(
@@ -1010,7 +1014,7 @@ class Pipeline:
 
         if not result.success:
             # One retry: try to fix errors via LLM
-            assembler = make_assembler(self.config)
+            assembler = make_assembler(self.config, template_context=self.template_context)
             orchestrator = autogen.UserProxyAgent(
                 name="Orchestrator",
                 human_input_mode="NEVER",
@@ -1180,7 +1184,7 @@ class Pipeline:
         path = Path(section_path)
         pandoc_latex = convert_markdown_to_latex(path, annotate=True)
 
-        assembler = make_assembler(self.config)
+        assembler = make_assembler(self.config, template_context=self.template_context)
         orchestrator = autogen.UserProxyAgent(
             name="Orchestrator",
             human_input_mode="NEVER",
@@ -1190,7 +1194,7 @@ class Pipeline:
         response = orchestrator.initiate_chat(
             assembler,
             message=(
-                f"Polish this Pandoc-converted LaTeX. Template: {self.config.template}. "
+                f"Polish this Pandoc-converted LaTeX. "
                 f"Only modify text between SAFE_ZONE markers.\n\n{pandoc_latex}"
             ),
             max_turns=1,

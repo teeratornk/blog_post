@@ -947,3 +947,31 @@ class TestTikzGenerateAndReview:
         """Default tikz_review_max_turns is 3."""
         config = ProjectConfig()
         assert config.tikz_review_max_turns == 3
+
+
+class TestTemplateContext:
+    def test_pipeline_has_template_context(self, tmp_path):
+        """Pipeline with elsarticle template has context mentioning frontmatter."""
+        config = ProjectConfig(
+            project_name="Test",
+            template="elsarticle",
+            draft_dir="drafts/",
+            output_dir="output/",
+        )
+        p = Pipeline(config, config_dir=tmp_path)
+        assert "frontmatter" in p.template_context.lower()
+        assert "elsarticle" in p.template_context
+        assert isinstance(p.template_context, str)
+        assert len(p.template_context) > 50
+
+    def test_pipeline_nonexistent_template(self, tmp_path):
+        """Pipeline with unknown template gets a fallback string."""
+        config = ProjectConfig(
+            project_name="Test",
+            template="nonexistent_xyz",
+            draft_dir="drafts/",
+            output_dir="output/",
+        )
+        p = Pipeline(config, config_dir=tmp_path)
+        assert "No template file found" in p.template_context
+        assert isinstance(p.template_context, str)
