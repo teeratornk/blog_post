@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from research_article_generator.models import (
+    BuildManifest,
     CompilationResult,
     CompilationWarning,
     FaithfulnessReport,
@@ -21,7 +22,9 @@ from research_article_generator.pipeline import (
     Pipeline,
     _comment_missing_figures,
     _extract_latex,
+    _insert_suggestion_comments,
     _looks_like_latex,
+    _parse_figure_suggestions,
 )
 
 
@@ -975,3 +978,118 @@ class TestTemplateContext:
         p = Pipeline(config, config_dir=tmp_path)
         assert "No template file found" in p.template_context
         assert isinstance(p.template_context, str)
+
+
+class TestInsertSuggestionComments:
+    def test_insert_suggestion_comments(self):
+        latex = "\\section{Results}\nSome results text."
+        suggestions = [
+            {
+                "description": "Line plot of training loss vs epochs",
+                "rationale": "Text describes training dynamics but no visualization.",
+                "plot_type": "line plot",
+                "data_source": "Training metrics from Section 3",
+                "suggested_caption": "Training loss convergence over 500 epochs.",
+            },
+        ]
+        result = _insert_suggestion_comments(latex, suggestions)
+        assert "%% === FIGURE SUGGESTIONS (auto-generated) ===" in result
+        assert "%% FIGURE_SUGGESTION: Line plot of training loss vs epochs" in result
+        assert "%%   Rationale: Text describes training dynamics but no visualization." in result
+        assert "%%   Plot type: line plot" in result
+        assert "%%   Data source: Training metrics from Section 3" in result
+        assert "%%   Suggested caption: Training loss convergence over 500 epochs." in result
+        # Original content preserved
+        assert "\\section{Results}" in result
+        assert "Some results text." in result
+
+    def test_insert_suggestion_comments_empty(self):
+        latex = "\\section{Intro}\nHello."
+        result = _insert_suggestion_comments(latex, [])
+        assert result == latex
+
+    def test_insert_multiple_suggestions(self):
+        latex = "\\section{Methods}\nMethod text."
+        suggestions = [
+            {
+                "description": "Flowchart of algorithm",
+                "rationale": "Steps described textually",
+                "plot_type": "diagram",
+                "data_source": "Algorithm 1 description",
+                "suggested_caption": "Algorithm flowchart.",
+            },
+            {
+                "description": "Bar chart of runtime",
+                "rationale": "Runtime comparison in text",
+                "plot_type": "bar chart",
+                "data_source": "Table 3",
+                "suggested_caption": "Runtime comparison.",
+            },
+        ]
+        result = _insert_suggestion_comments(latex, suggestions)
+        assert result.count("%% FIGURE_SUGGESTION:") == 2
+        assert "Flowchart of algorithm" in result
+        assert "Bar chart of runtime" in result
+
+
+class TestParseFigureSuggestions:
+    def test_parse_figure_suggestions_valid_json(self):
+        response = MagicMock(
+            summary='{"suggestions": [{"description": "Line plot", "rationale": "Data discussed", '
+            '"plot_type": "line plot", "data_source": "Table 1", "suggested_caption": "Loss curve."}]}'
+        )
+        result = _parse_figure_suggestions(response)
+        assert len(result) == 1
+        assert result[0]["description"] == "Line plot"
+        assert result[0]["plot_type"] == "line plot"
+
+    def test_parse_figure_suggestions_empty(self):
+        response = MagicMock(summary='{"suggestions": []}')
+        result = _parse_figure_suggestions(response)
+        assert result == []
+
+    def test_parse_figure_suggestions_fallback(self):
+        """Handles malformed response gracefully (returns empty list)."""
+        response = MagicMock(summary="This is not JSON at all, just text.")
+        result = _parse_figure_suggestions(response)
+        assert result == []
+
+    def test_parse_figure_suggestions_with_markdown_fences(self):
+        response = MagicMock(
+            summary='```json\n{"suggestions": [{"description": "Heatmap", "rationale": "Correlation data", '
+            '"plot_type": "heatmap", "data_source": "Matrix", "suggested_caption": "Heatmap."}]}\n```'
+        )
+        result = _parse_figure_suggestions(response)
+        assert len(result) == 1
+        assert result[0]["description"] == "Heatmap"
+
+    def test_parse_figure_suggestions_from_chat_history(self):
+        response = MagicMock(
+            summary=None,
+            chat_history=[{
+                "content": '{"suggestions": [{"description": "Diagram", "rationale": "Architecture", '
+                '"plot_type": "diagram", "data_source": "Sec 2", "suggested_caption": "Arch."}]}'
+            }],
+        )
+        result = _parse_figure_suggestions(response)
+        assert len(result) == 1
+        assert result[0]["description"] == "Diagram"
+
+
+class TestFigureSuggestionsState:
+    def test_pipeline_has_figure_suggestions_dict(self, pipeline):
+        assert hasattr(pipeline, "figure_suggestions")
+        assert isinstance(pipeline.figure_suggestions, dict)
+        assert pipeline.figure_suggestions == {}
+
+    def test_build_manifest_figure_suggestions_default(self):
+        m = BuildManifest(project_name="Test", output_dir="output/")
+        assert m.figure_suggestions_file is None
+
+    def test_build_manifest_figure_suggestions_set(self):
+        m = BuildManifest(
+            project_name="Test",
+            output_dir="output/",
+            figure_suggestions_file="figure_suggestions.json",
+        )
+        assert m.figure_suggestions_file == "figure_suggestions.json"

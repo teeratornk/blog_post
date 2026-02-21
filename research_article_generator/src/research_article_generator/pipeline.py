@@ -22,6 +22,7 @@ import autogen
 from .agents.citation_agent import make_citation_agent
 from .agents.equation_formatter import make_equation_formatter
 from .agents.figure_integrator import make_figure_integrator
+from .agents.figure_suggester import make_figure_suggester
 from .agents.tikz_generator import make_tikz_generator, make_tikz_reviewer, validate_tikz_review
 from .agents.latex_assembler import make_assembler
 from .agents.page_budget_manager import make_page_budget_manager
@@ -34,6 +35,7 @@ from .models import (
     CompilationResult,
     FaithfulnessReport,
     FaithfulnessViolation,
+    FigureSuggestionList,
     PipelinePhase,
     PipelineResult,
     ProjectConfig,
@@ -200,6 +202,65 @@ def _comment_missing_figures(latex: str, output_dir: Path) -> tuple[str, list[st
 
 
 # ---------------------------------------------------------------------------
+# Figure suggestion helpers
+# ---------------------------------------------------------------------------
+
+def _parse_figure_suggestions(response: Any) -> list[dict]:
+    """Extract a list of figure suggestion dicts from an AG2 response.
+
+    Attempts structured JSON parsing first, then falls back to extracting
+    any JSON object containing a ``suggestions`` key.
+    """
+    text = _extract_latex(response)
+
+    # Try full text as FigureSuggestionList
+    try:
+        parsed = FigureSuggestionList.model_validate_json(text)
+        return [s.model_dump() for s in parsed.suggestions]
+    except Exception:
+        pass
+
+    # Try to find JSON substring
+    if "{" in text:
+        json_str = text[text.find("{"):text.rfind("}") + 1]
+        try:
+            parsed = FigureSuggestionList.model_validate_json(json_str)
+            return [s.model_dump() for s in parsed.suggestions]
+        except Exception:
+            pass
+
+        # Last resort: try raw json.loads and look for suggestions key
+        try:
+            raw = json.loads(json_str)
+            if isinstance(raw, dict) and "suggestions" in raw:
+                return raw["suggestions"]
+        except Exception:
+            pass
+
+    return []
+
+
+def _insert_suggestion_comments(latex: str, suggestions: list[dict]) -> str:
+    """Append ``%% FIGURE_SUGGESTION`` LaTeX comments at the end of section content."""
+    if not suggestions:
+        return latex
+
+    lines = [
+        "",
+        "%% === FIGURE SUGGESTIONS (auto-generated) ===",
+    ]
+    for s in suggestions:
+        lines.append(f"%% FIGURE_SUGGESTION: {s.get('description', '')}")
+        lines.append(f"%%   Rationale: {s.get('rationale', '')}")
+        lines.append(f"%%   Plot type: {s.get('plot_type', '')}")
+        lines.append(f"%%   Data source: {s.get('data_source', '')}")
+        lines.append(f"%%   Suggested caption: {s.get('suggested_caption', '')}")
+    lines.append("")
+
+    return latex.rstrip() + "\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -240,6 +301,7 @@ class Pipeline:
         self.split_decision: SplitDecision | None = None
         self.supplementary_plan: SupplementaryPlan | None = None
         self.supplementary_compilation: CompilationResult | None = None
+        self.figure_suggestions: dict[str, list[dict]] = {}
         self.manifest: BuildManifest | None = None
 
     # -----------------------------------------------------------------------
@@ -514,6 +576,27 @@ class Pipeline:
                     latex = updated
             except Exception as e:
                 self.callbacks.on_warning(f"FigureIntegrator skipped for {section_id}: {e}")
+
+            # Figure suggestion pass (advisory, inserts LaTeX comments)
+            if self.config.figure_suggestion_enabled:
+                try:
+                    suggester = make_figure_suggester(self.config)
+                    response = orchestrator.initiate_chat(
+                        suggester,
+                        message=(
+                            f"Analyze this LaTeX section '{section_id}' and suggest up to "
+                            f"{self.config.figure_suggestion_max} figures/plots that should be "
+                            f"created. Only suggest figures where the text discusses data, "
+                            f"results, or methods without adequate visualization.\n\n{latex}"
+                        ),
+                        max_turns=1,
+                    )
+                    suggestions = _parse_figure_suggestions(response)
+                    if suggestions:
+                        self.figure_suggestions[section_id] = suggestions
+                        latex = _insert_suggestion_comments(latex, suggestions)
+                except Exception as e:
+                    self.callbacks.on_warning(f"FigureSuggester skipped for {section_id}: {e}")
 
             # Citation validation (report only, per section)
             if bib_content:
@@ -1105,6 +1188,16 @@ class Pipeline:
             generate_makefile(self.config, has_supplementary=has_supplementary),
             self.output_dir,
         )
+
+        # Write figure suggestions JSON
+        if self.figure_suggestions:
+            sugg_path = self.output_dir / "figure_suggestions.json"
+            sugg_path.write_text(
+                json.dumps(self.figure_suggestions, indent=2),
+                encoding="utf-8",
+            )
+            self.manifest.figure_suggestions_file = "figure_suggestions.json"
+            logger.info("Wrote %s", sugg_path)
 
         # Write manifest
         manifest_path = self.output_dir / "manifest.json"

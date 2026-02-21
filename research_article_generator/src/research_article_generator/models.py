@@ -75,6 +75,20 @@ class TikZReviewResult(BaseModel):
     issues: list[TikZIssue] = Field(default_factory=list, description="List of issues found")
 
 
+class FigureSuggestion(BaseModel):
+    """A single figure/plot suggestion for a section."""
+    description: str = Field(..., description="What to plot/show (e.g. 'Line plot of training loss vs epochs')")
+    rationale: str = Field(..., description="Why this figure would improve the section")
+    plot_type: str = Field(..., description="'line plot', 'bar chart', 'heatmap', 'schematic', 'diagram', etc.")
+    data_source: str = Field(..., description="What data to use (e.g. 'Table 2 results', 'Section 3 convergence data')")
+    suggested_caption: str = Field(..., description="Draft caption for the figure")
+
+
+class FigureSuggestionList(BaseModel):
+    """Structured output from the FigureSuggester agent."""
+    suggestions: list[FigureSuggestion] = Field(default_factory=list)
+
+
 class CompilationWarning(BaseModel):
     """A single warning or error from LaTeX compilation."""
     file: str = Field(default="", description="Source file")
@@ -200,6 +214,7 @@ class BuildManifest(BaseModel):
     supplementary_tex: str | None = Field(default=None, description="Path to supplementary .tex file")
     supplementary_pdf: str | None = Field(default=None, description="Path to supplementary .pdf file")
     supplementary_sections: list[str] = Field(default_factory=list, description="Sections moved to supplementary")
+    figure_suggestions_file: str | None = Field(default=None, description="Path to figure_suggestions.json")
 
 
 # ---------------------------------------------------------------------------
@@ -291,3 +306,7 @@ class ProjectConfig(BaseModel):
     # TikZ diagram generation
     tikz_enabled: bool = Field(default=False, description="Enable TikZ diagram generation from text")
     tikz_review_max_turns: int = Field(default=3, description="Max TikZ review-fix rounds")
+
+    # Figure suggestion
+    figure_suggestion_enabled: bool = Field(default=False, description="Enable figure suggestion agent")
+    figure_suggestion_max: int = Field(default=3, description="Max suggestions per section")

@@ -121,6 +121,7 @@ def build_role_llm_config(role: str, config: ProjectConfig) -> dict[str, Any]:
         "tikz_generator": models.assembler,
         "tikz_reviewer": models.assembler,
         "citation_agent": models.reviewer,
+        "figure_suggester": models.reviewer,
         "page_budget": models.reviewer,
         "editor": models.editor,
     }
