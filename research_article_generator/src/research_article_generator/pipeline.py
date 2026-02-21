@@ -324,11 +324,15 @@ class Pipeline:
         if self.config.page_budget:
             input_desc += f"Page budget: {self.config.page_budget}\n"
         input_desc += f"\nDraft files ({len(draft_files)}):\n"
+        input_desc += "You MUST map each of these files to exactly one section:\n"
+        for f in draft_files:
+            input_desc += f"  - {f.name}\n"
+        input_desc += "\n"
         for f in draft_files:
             content = f.read_text(encoding="utf-8")
             self.source_md[f.stem] = content
-            # Show first few lines for context
-            preview = "\n".join(content.splitlines()[:10])
+            # Show first 40 lines for context (full file if shorter)
+            preview = "\n".join(content.splitlines()[:40])
             input_desc += f"\n--- {f.name} ---\n{preview}\n...\n"
 
         if figure_files:
@@ -373,6 +377,23 @@ class Pipeline:
             )
 
         self.structure_plan = plan
+
+        # Auto-append any draft files not covered by the plan
+        planned_sources = {Path(s.source_file).stem for s in plan.sections}
+        next_priority = max((s.priority for s in plan.sections), default=0) + 1
+        for f in draft_files:
+            if f.stem not in planned_sources:
+                self.callbacks.on_warning(
+                    f"Draft file '{f.name}' was not in the plan — appending as new section"
+                )
+                plan.sections.append(SectionPlan(
+                    section_id=f.stem,
+                    title=f.stem.replace("_", " ").title(),
+                    source_file=str(f.relative_to(self.config_dir)),
+                    priority=next_priority,
+                ))
+                next_priority += 1
+
         self.callbacks.on_phase_end("PLANNING", True)
         return plan
 
@@ -439,10 +460,18 @@ class Pipeline:
                 # Fallback: try relative to draft_dir (LLM often omits the drafts/ prefix)
                 source_path = self.draft_dir / Path(section.source_file).name
             if not source_path.exists():
-                # Fallback: try matching by section_id stem
+                # Fallback 3: try matching by section_id glob
                 candidates = list(self.draft_dir.glob(f"*{section.section_id}*"))
                 if candidates:
                     source_path = candidates[0]
+            if not source_path.exists():
+                # Fallback 4: find best match by stem substring overlap
+                sec_stem = section.section_id.lower()
+                for draft_file in sorted(self.draft_dir.glob("*.md")):
+                    draft_stem = draft_file.stem.lower()
+                    if sec_stem in draft_stem or draft_stem in sec_stem:
+                        source_path = draft_file
+                        break
             if not source_path.exists():
                 logger.warning("Source file not found: %s, skipping", source_path)
                 self.callbacks.on_warning(f"Skipping {section.section_id}: source file not found")

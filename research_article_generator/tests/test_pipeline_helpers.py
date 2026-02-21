@@ -14,8 +14,10 @@ from research_article_generator.models import (
     FaithfulnessViolation,
     ProjectConfig,
     ReviewFeedback,
+    SectionPlan,
     SectionReviewResult,
     Severity,
+    StructurePlan,
     SupplementaryPlan,
 )
 from research_article_generator.pipeline import (
@@ -1093,3 +1095,192 @@ class TestFigureSuggestionsState:
             figure_suggestions_file="figure_suggestions.json",
         )
         assert m.figure_suggestions_file == "figure_suggestions.json"
+
+
+class TestReconcileUnmappedFiles:
+    """Tests for the auto-append reconciliation of unmapped draft files."""
+
+    def test_unmapped_file_appended_to_plan(self, tmp_path):
+        """A draft file not in the LLM plan gets auto-appended with correct source_file and default title."""
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path)
+
+        # Create draft files
+        draft_dir = tmp_path / "drafts"
+        draft_dir.mkdir()
+        (draft_dir / "01_intro.md").write_text("# Introduction\nHello.", encoding="utf-8")
+        (draft_dir / "acknowledgements.md").write_text("# Acknowledgements\nThanks.", encoding="utf-8")
+
+        # Simulate an LLM plan that only maps 01_intro
+        plan = StructurePlan(
+            title="Test Article",
+            sections=[
+                SectionPlan(
+                    section_id="01_intro",
+                    title="Introduction",
+                    source_file="drafts/01_intro.md",
+                    priority=1,
+                ),
+            ],
+        )
+
+        # Patch the LLM call to return our plan
+        with patch("research_article_generator.pipeline.make_structure_planner"), \
+             patch("research_article_generator.pipeline.autogen") as mock_autogen, \
+             patch("research_article_generator.pipeline._extract_json", return_value=plan):
+            mock_proxy = MagicMock()
+            mock_autogen.UserProxyAgent.return_value = mock_proxy
+            mock_proxy.initiate_chat.return_value = MagicMock()
+
+            result_plan = p.run_planning()
+
+        # acknowledgements.md should have been auto-appended
+        assert len(result_plan.sections) == 2
+        appended = result_plan.sections[1]
+        assert appended.section_id == "acknowledgements"
+        assert appended.title == "Acknowledgements"
+        assert "acknowledgements.md" in appended.source_file
+
+    def test_all_files_mapped_no_change(self, tmp_path):
+        """When all files are in the plan, no sections are appended."""
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path)
+
+        draft_dir = tmp_path / "drafts"
+        draft_dir.mkdir()
+        (draft_dir / "01_intro.md").write_text("# Introduction\nHello.", encoding="utf-8")
+
+        plan = StructurePlan(
+            title="Test Article",
+            sections=[
+                SectionPlan(
+                    section_id="01_intro",
+                    title="Introduction",
+                    source_file="drafts/01_intro.md",
+                    priority=1,
+                ),
+            ],
+        )
+
+        with patch("research_article_generator.pipeline.make_structure_planner"), \
+             patch("research_article_generator.pipeline.autogen") as mock_autogen, \
+             patch("research_article_generator.pipeline._extract_json", return_value=plan):
+            mock_proxy = MagicMock()
+            mock_autogen.UserProxyAgent.return_value = mock_proxy
+            mock_proxy.initiate_chat.return_value = MagicMock()
+
+            result_plan = p.run_planning()
+
+        assert len(result_plan.sections) == 1
+
+    def test_appended_section_has_incremented_priority(self, tmp_path):
+        """Auto-appended sections get priority after existing ones."""
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path)
+
+        draft_dir = tmp_path / "drafts"
+        draft_dir.mkdir()
+        (draft_dir / "01_intro.md").write_text("# Intro\n", encoding="utf-8")
+        (draft_dir / "ack.md").write_text("# Ack\n", encoding="utf-8")
+        (draft_dir / "data_prep.md").write_text("# Data\n", encoding="utf-8")
+
+        plan = StructurePlan(
+            title="Test Article",
+            sections=[
+                SectionPlan(
+                    section_id="01_intro",
+                    title="Introduction",
+                    source_file="drafts/01_intro.md",
+                    priority=5,
+                ),
+            ],
+        )
+
+        with patch("research_article_generator.pipeline.make_structure_planner"), \
+             patch("research_article_generator.pipeline.autogen") as mock_autogen, \
+             patch("research_article_generator.pipeline._extract_json", return_value=plan):
+            mock_proxy = MagicMock()
+            mock_autogen.UserProxyAgent.return_value = mock_proxy
+            mock_proxy.initiate_chat.return_value = MagicMock()
+
+            result_plan = p.run_planning()
+
+        assert len(result_plan.sections) == 3
+        # First appended should be priority 6, second 7
+        assert result_plan.sections[1].priority == 6
+        assert result_plan.sections[2].priority == 7
+
+
+class TestSourceFileResolution:
+    """Tests for the stem substring fallback in run_conversion()."""
+
+    def test_fallback_stem_substring_match(self, tmp_path):
+        """section_id 'preprocessing' resolves to 'data_preprocessing.md' via substring."""
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path)
+
+        draft_dir = tmp_path / "drafts"
+        draft_dir.mkdir()
+        (draft_dir / "data_preprocessing.md").write_text("# Data Preprocessing\nContent.", encoding="utf-8")
+
+        p.structure_plan = StructurePlan(
+            title="Test",
+            sections=[
+                SectionPlan(
+                    section_id="preprocessing",
+                    title="Data Preprocessing",
+                    source_file="drafts/data_prep.md",  # wrong name!
+                    priority=1,
+                ),
+            ],
+        )
+
+        with patch("research_article_generator.pipeline.make_assembler"), \
+             patch("research_article_generator.pipeline.autogen") as mock_autogen, \
+             patch("research_article_generator.pipeline.convert_markdown_to_latex", return_value="\\section{Data}"), \
+             patch("research_article_generator.pipeline.run_faithfulness_check") as mock_faith:
+            mock_proxy = MagicMock()
+            mock_autogen.UserProxyAgent.return_value = mock_proxy
+            # Assembler returns polished LaTeX
+            mock_response = MagicMock(summary="\\section{Data Preprocessing}\nContent.")
+            mock_proxy.initiate_chat.return_value = mock_response
+            mock_faith.return_value = FaithfulnessReport(
+                passed=True, violations=[], section_match=True,
+                math_match=True, citation_match=True, figure_match=True,
+            )
+
+            result = p.run_conversion()
+
+        # The section should have been converted (not skipped)
+        assert "preprocessing" in result
+
+    def test_fallback_no_substring_match_skips(self, tmp_path):
+        """Unrelated section_id still skips gracefully when no file matches."""
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path)
+
+        draft_dir = tmp_path / "drafts"
+        draft_dir.mkdir()
+        (draft_dir / "01_intro.md").write_text("# Intro\nContent.", encoding="utf-8")
+
+        p.structure_plan = StructurePlan(
+            title="Test",
+            sections=[
+                SectionPlan(
+                    section_id="totally_unrelated",
+                    title="Unrelated",
+                    source_file="drafts/nonexistent.md",
+                    priority=1,
+                ),
+            ],
+        )
+
+        with patch("research_article_generator.pipeline.make_assembler"), \
+             patch("research_article_generator.pipeline.autogen") as mock_autogen:
+            mock_proxy = MagicMock()
+            mock_autogen.UserProxyAgent.return_value = mock_proxy
+
+            result = p.run_conversion()
+
+        # The section should have been skipped
+        assert "totally_unrelated" not in result
