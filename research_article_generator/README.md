@@ -36,30 +36,43 @@ uv sync
 
 ## Usage
 
+The CLI uses [Hydra](https://hydra.cc/) for configuration. Point `--config-dir` at the directory containing your `config.yaml` and select the mode:
+
 ```bash
-# Full pipeline
-rag run --config config.yaml --output-dir output/
+# Full pipeline (auto-approve plan)
+rag --config-dir examples/cmame_example --config-name config mode=run no_approve=true
 
 # Dry run (planning only, no LLM)
-rag plan --config config.yaml
+rag --config-dir examples/cmame_example --config-name config mode=plan
 
 # Single section conversion (for testing)
-rag convert-section --config config.yaml --section drafts/02_methodology.md
+rag --config-dir examples/cmame_example --config-name config \
+    mode=convert_section section_file=drafts/02_methodology.md section_output=out.tex
 
 # Compile only (no LLM)
-rag compile --output-dir output/
+rag mode=compile output_dir=output/ engine=pdflatex
 
 # Validate faithfulness only
-rag validate --config config.yaml --output-dir output/
+rag --config-dir examples/cmame_example --config-name config mode=validate output_dir=output/
 ```
 
-Verbosity: `--verbose` / default / `--quiet`
+Any config field can be overridden from the command line:
+
+```bash
+rag --config-dir examples/cmame_example --config-name config mode=run page_budget=25 tikz_enabled=true
+```
+
+Verbosity: `verbose=true` / default / `quiet=true`
 
 ## Configuration
 
-Create a `config.yaml` (see `examples/cmame_example/config.yaml`):
+Create a `config.yaml` (see `examples/cmame_example/config.yaml`). The file must start with a Hydra `defaults` list:
 
 ```yaml
+defaults:
+  - rag_schema
+  - _self_
+
 project_name: "My Research Article"
 template: elsarticle
 journal_name: "My Journal"
@@ -69,10 +82,14 @@ figure_dir: figures/
 bibliography: references.bib
 
 azure:
-  api_key: "${AZURE_OPENAI_API_KEY}"
-  api_version: "${AZURE_OPENAI_API_VERSION}"
-  endpoint: "${AZURE_OPENAI_ENDPOINT}"
+  api_key: "${oc.env:AZURE_OPENAI_API_KEY}"
+  api_version: "${oc.env:AZURE_OPENAI_API_VERSION}"
+  endpoint: "${oc.env:AZURE_OPENAI_ENDPOINT}"
 ```
+
+- `rag_schema` loads structured defaults from the built-in schema — you only need to specify fields you want to override.
+- Environment variables use OmegaConf syntax: `${oc.env:VAR_NAME}`.
+- Azure credentials also fall back to `AZURE_OPENAI_*` env vars automatically if omitted.
 
 ## Testing
 

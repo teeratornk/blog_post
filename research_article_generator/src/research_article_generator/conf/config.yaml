@@ -1,0 +1,15 @@
+defaults:
+  - rag_schema
+  - _self_
+
+mode: run
+no_approve: false
+verbose: false
+quiet: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

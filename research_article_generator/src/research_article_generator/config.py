@@ -41,6 +41,18 @@ def _resolve_env_vars(value: Any) -> Any:
     return value
 
 
+def apply_azure_fallbacks(config: ProjectConfig) -> ProjectConfig:
+    """Fill empty azure credentials from environment variables and normalise endpoint."""
+    if not config.azure.api_key:
+        config.azure.api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
+    if not config.azure.api_version:
+        config.azure.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "")
+    if not config.azure.endpoint:
+        config.azure.endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    config.azure.endpoint = config.azure.endpoint.rstrip("/")
+    return config
+
+
 def load_config(config_path: str | Path) -> ProjectConfig:
     """Load a ``ProjectConfig`` from a YAML file.
 
@@ -57,19 +69,7 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 
     resolved = _resolve_env_vars(raw)
     config = ProjectConfig.model_validate(resolved)
-
-    # Fall back to env vars for azure credentials if not set in YAML
-    if not config.azure.api_key:
-        config.azure.api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
-    if not config.azure.api_version:
-        config.azure.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "")
-    if not config.azure.endpoint:
-        config.azure.endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-
-    # Strip trailing slashes from endpoint
-    config.azure.endpoint = config.azure.endpoint.rstrip("/")
-
-    return config
+    return apply_azure_fallbacks(config)
 
 
 # ---------------------------------------------------------------------------

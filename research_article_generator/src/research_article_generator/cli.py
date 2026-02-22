@@ -1,51 +1,75 @@
-"""CLI entry points using Click + rich-click.
+"""CLI entry point using Hydra.
 
-Commands:
-  rag run              — Full pipeline
-  rag plan             — Dry run (planning only, no LLM)
-  rag convert-section  — Single section conversion (for testing)
-  rag compile          — Compile only (no LLM)
-  rag validate         — Validate faithfulness only
+Usage examples:
+  rag --config-dir examples/cmame_example --config-name config mode=run no_approve=true
+  rag --config-dir examples/cmame_example --config-name config mode=plan
+  rag mode=compile output_dir=output/ engine=xelatex
+  rag --config-dir . --config-name config mode=validate
+  rag --config-dir . --config-name config mode=convert_section section_file=drafts/01_intro.md section_output=out.tex
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
-import rich_click as click
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
-from .config import load_config
+from ._hydra_conf import CLI_ONLY_KEYS, register_configs
+from .config import apply_azure_fallbacks
 from .logging_config import RichCallbacks, console, setup_logging
-from .pipeline import Pipeline
+from .models import ProjectConfig
+
+register_configs()
+
+# ---------------------------------------------------------------------------
+# Hydra DictConfig → Pydantic ProjectConfig bridge
+# ---------------------------------------------------------------------------
 
 
-@click.group()
-@click.option("--verbose", "-v", is_flag=True, help="Full agent logs")
-@click.option("--quiet", "-q", is_flag=True, help="Errors only")
-@click.pass_context
-def cli(ctx: click.Context, verbose: bool, quiet: bool) -> None:
-    """Research Article LaTeX Generator — transform markdown drafts into publication-ready LaTeX."""
-    ctx.ensure_object(dict)
-    ctx.obj["verbose"] = verbose
-    ctx.obj["quiet"] = quiet
-    setup_logging(verbose=verbose, quiet=quiet)
+def _to_project_config(cfg: DictConfig) -> ProjectConfig:
+    """Convert a Hydra *DictConfig* to a Pydantic ``ProjectConfig``.
+
+    CLI-only keys (``mode``, ``verbose``, etc.) are stripped before validation.
+    Azure credential env-var fallbacks are applied afterwards.
+    """
+    container: dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # type: ignore[assignment]
+    for key in CLI_ONLY_KEYS:
+        container.pop(key, None)
+    config = ProjectConfig.model_validate(container)
+    return apply_azure_fallbacks(config)
 
 
-@cli.command()
-@click.option("--config", "-c", "config_path", required=True, type=click.Path(exists=True), help="Path to config.yaml")
-@click.option("--output-dir", "-o", type=click.Path(), default=None, help="Override output directory")
-@click.pass_context
-def run(ctx: click.Context, config_path: str, output_dir: str | None) -> None:
-    """Run the full pipeline."""
-    config_file = Path(config_path)
-    config = load_config(config_file)
-    config_dir = config_file.parent
+def _get_config_dir() -> Path:
+    """Extract ``--config-dir`` from *sys.argv* (before Hydra consumes it).
 
-    if output_dir:
-        config.output_dir = output_dir
+    Falls back to the current working directory.
+    """
+    for i, arg in enumerate(sys.argv):
+        if arg == "--config-dir" and i + 1 < len(sys.argv):
+            return Path(sys.argv[i + 1])
+        if arg.startswith("--config-dir="):
+            return Path(arg.split("=", 1)[1])
+    return Path.cwd()
 
-    callbacks = RichCallbacks()
+
+# ---------------------------------------------------------------------------
+# Mode handlers
+# ---------------------------------------------------------------------------
+
+
+def _run_mode(cfg: DictConfig) -> None:
+    config = _to_project_config(cfg)
+    config_dir = _get_config_dir()
+
+    if cfg.get("output_dir") is not None:
+        config.output_dir = cfg.output_dir
+
+    from .pipeline import Pipeline
+
+    callbacks = RichCallbacks(interactive=not cfg.no_approve)
     pipeline = Pipeline(config, config_dir=config_dir, callbacks=callbacks)
 
     console.print("[bold]Starting full pipeline...[/]")
@@ -65,14 +89,11 @@ def run(ctx: click.Context, config_path: str, output_dir: str | None) -> None:
         sys.exit(1)
 
 
-@cli.command()
-@click.option("--config", "-c", "config_path", required=True, type=click.Path(exists=True), help="Path to config.yaml")
-@click.pass_context
-def plan(ctx: click.Context, config_path: str) -> None:
-    """Dry run — planning only, no LLM calls."""
-    config_file = Path(config_path)
-    config = load_config(config_file)
-    config_dir = config_file.parent
+def _plan_mode(cfg: DictConfig) -> None:
+    config = _to_project_config(cfg)
+    config_dir = _get_config_dir()
+
+    from .pipeline import Pipeline
 
     callbacks = RichCallbacks()
     pipeline = Pipeline(config, config_dir=config_dir, callbacks=callbacks)
@@ -88,36 +109,11 @@ def plan(ctx: click.Context, config_path: str) -> None:
         console.print(f"  Budget: {structure.page_budget} pages ({structure.budget_status})")
 
 
-@cli.command("convert-section")
-@click.option("--config", "-c", "config_path", required=True, type=click.Path(exists=True), help="Path to config.yaml")
-@click.option("--section", "-s", required=True, type=click.Path(exists=True), help="Path to section .md file")
-@click.option("--output", "-o", type=click.Path(), default=None, help="Output .tex file (stdout if omitted)")
-@click.pass_context
-def convert_section(ctx: click.Context, config_path: str, section: str, output: str | None) -> None:
-    """Convert a single section (for testing)."""
-    config_file = Path(config_path)
-    config = load_config(config_file)
-    config_dir = config_file.parent
-
-    callbacks = RichCallbacks()
-    pipeline = Pipeline(config, config_dir=config_dir, callbacks=callbacks)
-
-    latex = pipeline.run_convert_section(section)
-
-    if output:
-        Path(output).write_text(latex, encoding="utf-8")
-        console.print(f"[green]Written to {output}[/]")
-    else:
-        console.print(latex)
-
-
-@cli.command()
-@click.option("--output-dir", "-o", required=True, type=click.Path(exists=True), help="Output directory with main.tex")
-@click.option("--engine", default="pdflatex", type=click.Choice(["pdflatex", "xelatex", "lualatex"]))
-@click.pass_context
-def compile(ctx: click.Context, output_dir: str, engine: str) -> None:
-    """Compile existing LaTeX project (no LLM)."""
+def _compile_mode(cfg: DictConfig) -> None:
     from .tools.compiler import run_latexmk
+
+    output_dir = cfg.get("output_dir", "output/")
+    engine = cfg.get("engine", "pdflatex")
 
     result = run_latexmk(output_dir, engine)
     if result.success:
@@ -131,16 +127,14 @@ def compile(ctx: click.Context, output_dir: str, engine: str) -> None:
         sys.exit(1)
 
 
-@cli.command()
-@click.option("--config", "-c", "config_path", required=True, type=click.Path(exists=True), help="Path to config.yaml")
-@click.option("--output-dir", "-o", required=True, type=click.Path(exists=True), help="Output directory with main.tex")
-@click.pass_context
-def validate(ctx: click.Context, config_path: str, output_dir: str) -> None:
-    """Validate faithfulness of generated LaTeX against source."""
-    config_file = Path(config_path)
-    config = load_config(config_file)
-    config_dir = config_file.parent
-    config.output_dir = output_dir
+def _validate_mode(cfg: DictConfig) -> None:
+    config = _to_project_config(cfg)
+    config_dir = _get_config_dir()
+
+    if cfg.get("output_dir") is not None:
+        config.output_dir = cfg.output_dir
+
+    from .pipeline import Pipeline
 
     callbacks = RichCallbacks()
     pipeline = Pipeline(config, config_dir=config_dir, callbacks=callbacks)
@@ -166,3 +160,63 @@ def validate(ctx: click.Context, config_path: str, output_dir: str) -> None:
 
     if not report.passed:
         sys.exit(1)
+
+
+def _convert_section_mode(cfg: DictConfig) -> None:
+    config = _to_project_config(cfg)
+    config_dir = _get_config_dir()
+
+    section_file = cfg.get("section_file")
+    section_output = cfg.get("section_output")
+
+    if not section_file:
+        console.print("[red]section_file is required for convert_section mode[/]")
+        sys.exit(1)
+
+    from .pipeline import Pipeline
+
+    callbacks = RichCallbacks()
+    pipeline = Pipeline(config, config_dir=config_dir, callbacks=callbacks)
+
+    latex = pipeline.run_convert_section(section_file)
+
+    if section_output:
+        Path(section_output).write_text(latex, encoding="utf-8")
+        console.print(f"[green]Written to {section_output}[/]")
+    else:
+        console.print(latex)
+
+
+_MODE_DISPATCH: dict[str, Any] = {
+    "run": _run_mode,
+    "plan": _plan_mode,
+    "compile": _compile_mode,
+    "validate": _validate_mode,
+    "convert_section": _convert_section_mode,
+}
+
+
+# ---------------------------------------------------------------------------
+# Hydra entry point
+# ---------------------------------------------------------------------------
+
+_PACKAGE_CONF = str(Path(__file__).resolve().parent / "conf")
+
+
+@hydra.main(config_path="conf", config_name="config", version_base=None)
+def hydra_entry(cfg: DictConfig) -> None:
+    """Hydra-managed CLI entry point."""
+    setup_logging(verbose=cfg.get("verbose", False), quiet=cfg.get("quiet", False))
+
+    mode = cfg.get("mode", "run")
+    handler = _MODE_DISPATCH.get(mode)
+    if handler is None:
+        console.print(f"[red]Unknown mode: {mode!r}. Choose from: {', '.join(_MODE_DISPATCH)}[/]")
+        sys.exit(1)
+
+    handler(cfg)
+
+
+def main() -> None:
+    """Package entry point (``[project.scripts]`` target)."""
+    hydra_entry()  # pylint: disable=no-value-for-parameter

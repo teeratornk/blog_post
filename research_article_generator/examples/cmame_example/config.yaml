@@ -1,3 +1,7 @@
+defaults:
+  - rag_schema
+  - _self_
+
 project_name: "Physics-Informed Neural Networks for Computational Mechanics"
 template: elsarticle
 journal_name: "Computer Methods in Applied Mechanics and Engineering"
@@ -11,9 +15,9 @@ bibliography: references.bib
 output_dir: output/
 
 azure:
-  api_key: "${AZURE_OPENAI_API_KEY}"
-  api_version: "${AZURE_OPENAI_API_VERSION}"
-  endpoint: "${AZURE_OPENAI_ENDPOINT}"
+  api_key: "${oc.env:AZURE_OPENAI_API_KEY}"
+  api_version: "${oc.env:AZURE_OPENAI_API_VERSION}"
+  endpoint: "${oc.env:AZURE_OPENAI_ENDPOINT}"
 
 models:
   default: gpt-5.2
@@ -25,6 +29,11 @@ review_max_turns: 2
 review_max_rounds: 2
 timeout: 120
 seed: 42
+
+supplementary_mode: auto
+supplementary_threshold: 1.2
+
+tikz_enabled: true
 
 enabled_reviewers:
   LaTeXLinter: true
