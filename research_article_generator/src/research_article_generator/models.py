@@ -30,6 +30,18 @@ class PipelinePhase(str, Enum):
     FINALIZATION = "finalization"
 
 
+class PlanAction(str, Enum):
+    APPROVE = "approve"
+    REVISE = "revise"
+    ABORT = "abort"
+
+
+class PlanReviewResult(BaseModel):
+    """Result of a human plan review: approve, revise (with feedback), or abort."""
+    action: PlanAction = PlanAction.APPROVE
+    feedback: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Structure Planning
 # ---------------------------------------------------------------------------
@@ -56,6 +68,7 @@ class StructurePlan(BaseModel):
     total_estimated_pages: float = Field(default=0.0, description="Total estimated pages")
     page_budget: int | None = Field(default=None, description="Target page count")
     budget_status: str = Field(default="ok", description="'ok', 'over', or 'under'")
+    plan_review_notes: str | None = Field(default=None, description="Notes from PlanReviewer agent")
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +293,7 @@ class ProjectConfig(BaseModel):
     compile_max_attempts: int = Field(default=3, description="Max compile-fix loop attempts")
     review_max_turns: int = Field(default=2, description="Max turns per reviewer")
     review_max_rounds: int = Field(default=2, description="Max review-fix-recompile rounds")
+    max_plan_revisions: int = Field(default=3, description="Max plan revision rounds before auto-approving")
     timeout: int = Field(default=120, description="LLM call timeout in seconds")
     seed: int = Field(default=42, description="LLM seed for reproducibility")
 
@@ -300,6 +314,7 @@ class ProjectConfig(BaseModel):
             "StyleChecker": True,
             "FaithfulnessChecker": True,
             "MetaReviewer": True,
+            "PlanReviewer": True,
         }
     )
 

@@ -12,6 +12,8 @@ from research_article_generator.models import (
     CompilationWarning,
     FaithfulnessReport,
     FaithfulnessViolation,
+    PlanAction,
+    PlanReviewResult,
     ProjectConfig,
     ReviewFeedback,
     SectionPlan,
@@ -20,6 +22,7 @@ from research_article_generator.models import (
     StructurePlan,
     SupplementaryPlan,
 )
+from research_article_generator.logging_config import RichCallbacks
 from research_article_generator.pipeline import (
     Pipeline,
     _comment_missing_figures,
@@ -1284,3 +1287,154 @@ class TestSourceFileResolution:
 
         # The section should have been skipped
         assert "totally_unrelated" not in result
+
+
+class TestPlanReviewLoop:
+    """Tests for the plan approval gate in Pipeline.run()."""
+
+    def _make_plan(self):
+        return StructurePlan(
+            title="Test Article",
+            sections=[
+                SectionPlan(
+                    section_id="01_intro",
+                    title="Introduction",
+                    source_file="drafts/01_intro.md",
+                    priority=1,
+                    estimated_pages=2.0,
+                ),
+            ],
+            total_estimated_pages=2.0,
+        )
+
+    def test_auto_approve_skips_review(self, tmp_path):
+        """With non-interactive callbacks, pipeline proceeds without prompting."""
+        callbacks = RichCallbacks(interactive=False)
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path, callbacks=callbacks)
+
+        plan = self._make_plan()
+
+        with patch.object(p, "run_planning", return_value=plan) as mock_planning, \
+             patch.object(p, "run_conversion"), \
+             patch.object(p, "run_post_processing"), \
+             patch.object(p, "run_compilation_review"), \
+             patch.object(p, "run_page_budget"), \
+             patch.object(p, "run_supplementary"), \
+             patch.object(p, "run_finalization"):
+            p.structure_plan = plan
+            p.compilation_result = CompilationResult(success=True, pdf_path="out.pdf")
+            p.manifest = BuildManifest(project_name="Test", output_dir="output/")
+            result = p.run()
+
+        # Planning called only once (no revision)
+        mock_planning.assert_called_once_with()
+        assert result.phases_completed[0] == "planning"
+
+    def test_abort_stops_pipeline(self, tmp_path):
+        """ABORT action returns early with error message."""
+        callbacks = MagicMock()
+        callbacks.on_plan_review.return_value = PlanReviewResult(action=PlanAction.ABORT)
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path, callbacks=callbacks)
+
+        plan = self._make_plan()
+
+        with patch.object(p, "run_planning", return_value=plan), \
+             patch.object(p, "run_conversion") as mock_conversion:
+            p.structure_plan = plan
+            result = p.run()
+
+        assert result.success is False
+        assert "aborted" in result.errors[0].lower()
+        mock_conversion.assert_not_called()
+
+    def test_revise_reruns_planning(self, tmp_path):
+        """REVISE action triggers run_planning again with feedback."""
+        callbacks = MagicMock()
+        callbacks.on_plan_review.side_effect = [
+            PlanReviewResult(action=PlanAction.REVISE, feedback="Add a conclusion section"),
+            PlanReviewResult(action=PlanAction.APPROVE),
+        ]
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path, callbacks=callbacks)
+
+        plan = self._make_plan()
+
+        with patch.object(p, "run_planning", return_value=plan) as mock_planning, \
+             patch.object(p, "run_conversion"), \
+             patch.object(p, "run_post_processing"), \
+             patch.object(p, "run_compilation_review"), \
+             patch.object(p, "run_page_budget"), \
+             patch.object(p, "run_supplementary"), \
+             patch.object(p, "run_finalization"):
+            p.structure_plan = plan
+            p.compilation_result = CompilationResult(success=True, pdf_path="out.pdf")
+            p.manifest = BuildManifest(project_name="Test", output_dir="output/")
+            result = p.run()
+
+        # Planning called twice: initial + revision
+        assert mock_planning.call_count == 2
+        mock_planning.assert_any_call()
+        mock_planning.assert_any_call(revision_feedback="Add a conclusion section")
+
+    def test_revision_feedback_in_planner_message(self, tmp_path):
+        """Verify the planner receives the previous plan + feedback text."""
+        config = ProjectConfig(project_name="Test", draft_dir="drafts/", output_dir="output/")
+        p = Pipeline(config, config_dir=tmp_path)
+
+        draft_dir = tmp_path / "drafts"
+        draft_dir.mkdir()
+        (draft_dir / "01_intro.md").write_text("# Intro\nHello.", encoding="utf-8")
+
+        # Set an initial plan
+        p.structure_plan = self._make_plan()
+
+        with patch("research_article_generator.pipeline.make_structure_planner"), \
+             patch("research_article_generator.pipeline.make_plan_reviewer", return_value=None), \
+             patch("research_article_generator.pipeline.autogen") as mock_autogen, \
+             patch("research_article_generator.pipeline._extract_json", return_value=self._make_plan()):
+            mock_proxy = MagicMock()
+            mock_autogen.UserProxyAgent.return_value = mock_proxy
+            mock_proxy.initiate_chat.return_value = MagicMock()
+
+            p.run_planning(revision_feedback="Move methodology before results")
+
+        # Check the message sent to the planner (first call is the planner)
+        call_args = mock_proxy.initiate_chat.call_args
+        message = call_args[1]["message"] if "message" in call_args[1] else call_args[0][1]
+        assert "user requested changes" in message
+        assert "Move methodology before results" in message
+        assert "01_intro" in message  # previous plan JSON should be included
+
+    def test_max_revisions_exceeded_auto_approves(self, tmp_path):
+        """After max_plan_revisions the loop exits and pipeline continues."""
+        callbacks = MagicMock()
+        # Always return REVISE — should stop after max_plan_revisions iterations
+        callbacks.on_plan_review.return_value = PlanReviewResult(
+            action=PlanAction.REVISE, feedback="Keep changing it"
+        )
+        config = ProjectConfig(
+            project_name="Test", draft_dir="drafts/", output_dir="output/",
+            max_plan_revisions=2,
+        )
+        p = Pipeline(config, config_dir=tmp_path, callbacks=callbacks)
+
+        plan = self._make_plan()
+
+        with patch.object(p, "run_planning", return_value=plan) as mock_planning, \
+             patch.object(p, "run_conversion"), \
+             patch.object(p, "run_post_processing"), \
+             patch.object(p, "run_compilation_review"), \
+             patch.object(p, "run_page_budget"), \
+             patch.object(p, "run_supplementary"), \
+             patch.object(p, "run_finalization"):
+            p.structure_plan = plan
+            p.compilation_result = CompilationResult(success=True, pdf_path="out.pdf")
+            p.manifest = BuildManifest(project_name="Test", output_dir="output/")
+            result = p.run()
+
+        # on_plan_review called max_plan_revisions times
+        assert callbacks.on_plan_review.call_count == 2
+        # run_planning: 1 initial + 2 revisions = 3
+        assert mock_planning.call_count == 3

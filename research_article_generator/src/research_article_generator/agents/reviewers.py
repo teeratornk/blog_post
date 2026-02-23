@@ -168,6 +168,20 @@ def reflection_message(recipient: Any, messages: list[dict], sender: Any, config
 # ---------------------------------------------------------------------------
 
 
+def make_plan_reviewer(config: ProjectConfig) -> autogen.AssistantAgent | None:
+    """Create the PlanReviewer agent if enabled in config."""
+    return _maybe(
+        "PlanReviewer", "plan_reviewer",
+        "a structure plan reviewer for research articles. You receive a StructurePlan JSON "
+        "and check for: (1) logical section ordering — introduction before methods, methods "
+        "before results, results before discussion/conclusion; (2) all draft files covered; "
+        "(3) page estimates reasonable vs budget; (4) missing standard sections (abstract, "
+        "conclusion); (5) section granularity. In your Review field, list only actionable "
+        "issues. If the plan is sound, say 'No issues found'",
+        config,
+    )
+
+
 def make_reviewers(config: ProjectConfig) -> dict[str, autogen.AssistantAgent | None]:
     """Create all reviewer agents based on config."""
     return {

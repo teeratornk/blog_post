@@ -71,6 +71,7 @@ class RagConf:
         "StyleChecker": True,
         "FaithfulnessChecker": True,
         "MetaReviewer": True,
+        "PlanReviewer": True,
     })
 
     tikz_enabled: bool = False

@@ -26,7 +26,7 @@ from .agents.figure_suggester import make_figure_suggester
 from .agents.tikz_generator import make_tikz_generator, make_tikz_reviewer, validate_tikz_review
 from .agents.latex_assembler import make_assembler
 from .agents.page_budget_manager import make_page_budget_manager
-from .agents.reviewers import make_meta_reviewer, make_reviewers, reflection_message, build_summary_args
+from .agents.reviewers import make_meta_reviewer, make_plan_reviewer, make_reviewers, reflection_message, build_summary_args, validate_review
 from .agents.structure_planner import make_structure_planner
 from .config import build_role_llm_config
 from .logging_config import PipelineCallbacks, RichCallbacks, logger
@@ -38,6 +38,7 @@ from .models import (
     FigureSuggestionList,
     PipelinePhase,
     PipelineResult,
+    PlanAction,
     ProjectConfig,
     ReviewFeedback,
     SectionReviewResult,
@@ -308,8 +309,13 @@ class Pipeline:
     # Phase 1: Planning
     # -----------------------------------------------------------------------
 
-    def run_planning(self) -> StructurePlan:
-        """Phase 1: Analyze inputs and produce a structure plan."""
+    def run_planning(self, revision_feedback: str | None = None) -> StructurePlan:
+        """Phase 1: Analyze inputs and produce a structure plan.
+
+        Args:
+            revision_feedback: If provided, the previous plan is sent back to the
+                planner along with this feedback text so it can produce a revised plan.
+        """
         self.callbacks.on_phase_start("PLANNING", "Analyzing inputs and creating structure plan")
 
         draft_files = _list_draft_files(self.draft_dir)
@@ -324,7 +330,12 @@ class Pipeline:
         if self.config.page_budget:
             input_desc += f"Page budget: {self.config.page_budget}\n"
         input_desc += f"\nDraft files ({len(draft_files)}):\n"
-        input_desc += "You MUST map each of these files to exactly one section:\n"
+        input_desc += (
+            "Every file below MUST appear as the source_file of at least one section.\n"
+            "A file MAY be split across multiple sections (e.g. a long methodology file "
+            "can become 'Problem Statement' + 'Numerical Method'), but no content should "
+            "be duplicated across sections.\n"
+        )
         for f in draft_files:
             input_desc += f"  - {f.name}\n"
         input_desc += "\n"
@@ -343,6 +354,17 @@ class Pipeline:
         if self.bib_file and self.bib_file.exists():
             input_desc += f"\nBibliography: {self.bib_file.name}\n"
 
+        # Build the planner message, optionally prepending revision context
+        message = ""
+        if revision_feedback and self.structure_plan:
+            message += (
+                "The following structure plan was proposed but the user requested changes:\n\n"
+                f"{self.structure_plan.model_dump_json(indent=2)}\n\n"
+                f"User feedback: \"{revision_feedback}\"\n\n"
+                "Please produce a revised structure plan that addresses this feedback.\n\n"
+            )
+        message += f"Create a structure plan for this research article:\n\n{input_desc}"
+
         # Use AG2 agent
         planner = make_structure_planner(self.config, template_context=self.template_context)
         orchestrator = autogen.UserProxyAgent(
@@ -353,7 +375,7 @@ class Pipeline:
 
         response = orchestrator.initiate_chat(
             planner,
-            message=f"Create a structure plan for this research article:\n\n{input_desc}",
+            message=message,
             max_turns=1,
         )
 
@@ -394,8 +416,120 @@ class Pipeline:
                 ))
                 next_priority += 1
 
+        # PlanReviewer: automated quality check + optional auto-revision
+        plan, review_notes = self._review_plan(plan, draft_files)
+
+        # Re-run auto-append after possible revision
+        if review_notes is not None:
+            planned_sources = {Path(s.source_file).stem for s in plan.sections}
+            next_priority = max((s.priority for s in plan.sections), default=0) + 1
+            for f in draft_files:
+                if f.stem not in planned_sources:
+                    self.callbacks.on_warning(
+                        f"Draft file '{f.name}' was not in the revised plan — appending as new section"
+                    )
+                    plan.sections.append(SectionPlan(
+                        section_id=f.stem,
+                        title=f.stem.replace("_", " ").title(),
+                        source_file=str(f.relative_to(self.config_dir)),
+                        priority=next_priority,
+                    ))
+                    next_priority += 1
+
+        plan.plan_review_notes = review_notes
+        self.structure_plan = plan
+
         self.callbacks.on_phase_end("PLANNING", True)
         return plan
+
+    def _review_plan(
+        self,
+        plan: StructurePlan,
+        draft_files: list[Path],
+    ) -> tuple[StructurePlan, str | None]:
+        """Run PlanReviewer on the structure plan and optionally auto-revise.
+
+        Returns ``(plan, review_notes)`` where *review_notes* is ``None`` when
+        the reviewer is disabled or finds no issues.
+        """
+        try:
+            reviewer = make_plan_reviewer(self.config)
+        except Exception as e:
+            logger.warning("PlanReviewer creation failed: %s", e)
+            return plan, None
+
+        if reviewer is None:
+            return plan, None
+
+        orchestrator = autogen.UserProxyAgent(
+            name="Orchestrator",
+            human_input_mode="NEVER",
+            code_execution_config=False,
+        )
+
+        draft_names = [f.name for f in draft_files]
+
+        try:
+            review_response = orchestrator.initiate_chat(
+                reviewer,
+                message=(
+                    "Review this structure plan for a research article.\n\n"
+                    f"Plan JSON:\n{plan.model_dump_json(indent=2)}\n\n"
+                    f"Draft files available: {draft_names}"
+                ),
+                max_turns=1,
+            )
+
+            raw_text = _extract_latex(review_response)
+            feedback, err = validate_review(raw_text)
+
+            if feedback is None:
+                logger.warning("Could not parse PlanReviewer response: %s", err)
+                return plan, None
+
+            review_text = feedback.Review
+
+            # Check if no issues were found
+            no_issue_phrases = ("no issues", "looks good", "no problems", "plan is sound")
+            if any(phrase in review_text.lower() for phrase in no_issue_phrases):
+                return plan, None
+
+            # Issues found — attempt one auto-revision round
+            logger.info("PlanReviewer found issues, attempting auto-revision")
+            try:
+                planner = make_structure_planner(self.config, template_context=self.template_context)
+                revision_orchestrator = autogen.UserProxyAgent(
+                    name="Orchestrator",
+                    human_input_mode="NEVER",
+                    code_execution_config=False,
+                )
+
+                revision_response = revision_orchestrator.initiate_chat(
+                    planner,
+                    message=(
+                        "The following structure plan was reviewed and issues were found.\n\n"
+                        f"Original plan:\n{plan.model_dump_json(indent=2)}\n\n"
+                        f"PlanReviewer feedback:\n{review_text}\n\n"
+                        f"Draft files available: {draft_names}\n\n"
+                        "Please produce a revised structure plan that addresses this feedback."
+                    ),
+                    max_turns=1,
+                )
+
+                revised = _extract_json(revision_response, StructurePlan)
+                if revised is not None:
+                    return revised, review_text
+                else:
+                    logger.warning("Auto-revision failed to produce valid plan, keeping original")
+                    return plan, review_text
+
+            except Exception as e:
+                logger.warning("Auto-revision failed: %s", e)
+                return plan, review_text
+
+        except Exception as e:
+            logger.warning("PlanReviewer failed: %s", e)
+            return plan, None
 
     # -----------------------------------------------------------------------
     # Phase 2: Conversion (with per-section review)
@@ -1252,6 +1386,21 @@ class Pipeline:
         try:
             self.run_planning()
             phases.append(PipelinePhase.PLANNING)
+
+            # Plan approval gate
+            for _ in range(self.config.max_plan_revisions):
+                review = self.callbacks.on_plan_review(self.structure_plan)
+                if review.action == PlanAction.APPROVE:
+                    break
+                elif review.action == PlanAction.ABORT:
+                    return PipelineResult(
+                        success=False,
+                        structure_plan=self.structure_plan,
+                        errors=["Pipeline aborted by user during plan review"],
+                        phases_completed=phases,
+                    )
+                else:  # REVISE
+                    self.run_planning(revision_feedback=review.feedback)
 
             self.run_conversion()
             phases.append(PipelinePhase.CONVERSION)
