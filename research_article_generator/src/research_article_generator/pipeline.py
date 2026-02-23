@@ -495,7 +495,7 @@ class Pipeline:
                 return plan, None
 
             # Issues found — attempt one auto-revision round
-            logger.info("PlanReviewer found issues, attempting auto-revision")
+            self.callbacks.on_warning(f"PlanReviewer found issues, attempting auto-revision")
             try:
                 planner = make_structure_planner(self.config, template_context=self.template_context)
                 revision_orchestrator = autogen.UserProxyAgent(
@@ -511,13 +511,15 @@ class Pipeline:
                         f"Original plan:\n{plan.model_dump_json(indent=2)}\n\n"
                         f"PlanReviewer feedback:\n{review_text}\n\n"
                         f"Draft files available: {draft_names}\n\n"
-                        "Please produce a revised structure plan that addresses this feedback."
+                        "Please produce a REVISED StructurePlan JSON that addresses this feedback. "
+                        "Return ONLY valid JSON matching the StructurePlan schema."
                     ),
                     max_turns=1,
                 )
 
                 revised = _extract_json(revision_response, StructurePlan)
                 if revised is not None:
+                    self.callbacks.on_warning("PlanReviewer auto-revision applied successfully")
                     return revised, review_text
                 else:
                     logger.warning("Auto-revision failed to produce valid plan, keeping original")
