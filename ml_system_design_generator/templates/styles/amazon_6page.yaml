@@ -1,0 +1,37 @@
+name: "Amazon 6-Page Narrative Memo"
+description: "Long-form narrative memo for complex system designs"
+max_pages_default: 6
+sections:
+  - id: situation
+    title: "Situation / Problem Statement"
+    guidance: "Describe the current state, pain points, and why this system is needed. Use data."
+    estimated_pages: 0.5
+  - id: tenets
+    title: "Tenets"
+    guidance: "List 3-5 guiding principles that constrain the design. Each with rationale."
+    estimated_pages: 0.3
+  - id: approach
+    title: "Proposed Approach"
+    guidance: "Detailed ML system architecture. Include data pipeline, model architecture, training, serving, monitoring."
+    estimated_pages: 2.0
+  - id: alternatives
+    title: "Alternatives Considered"
+    guidance: "At least 2 alternatives with pros/cons analysis. Explain why the chosen approach wins."
+    estimated_pages: 1.0
+  - id: risks
+    title: "Risks and Mitigations"
+    guidance: "Technical risks, operational risks, timeline risks. Concrete mitigation strategies."
+    estimated_pages: 0.5
+  - id: metrics
+    title: "Success Metrics and Monitoring"
+    guidance: "Offline metrics, online metrics, business metrics. SLAs. Monitoring and alerting plan."
+    estimated_pages: 0.5
+  - id: timeline
+    title: "Timeline and Milestones"
+    guidance: "Phased rollout plan. Key milestones with owners and dates."
+    estimated_pages: 0.3
+  - id: appendix
+    title: "Appendix"
+    guidance: "Data schemas, API contracts, detailed diagrams, cost estimates."
+    estimated_pages: 0.9
+    optional: true

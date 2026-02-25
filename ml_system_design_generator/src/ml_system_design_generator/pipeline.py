@@ -1,0 +1,843 @@
+"""Pipeline — 4-phase orchestration for ML system design generation.
+
+Phase 1: CONFIGURATION   — Validate config, interactive fill-in
+Phase 2: UNDERSTANDING   — Read & summarize docs, gap analysis, vector DB
+Phase 3: DESIGN          — Plan structure, write sections, review, compile
+Phase 4: USER_REVIEW     — Present draft, collect feedback, revise
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+import autogen
+
+from .agents.consistency_checker import make_consistency_checker
+from .agents.design_planner import make_design_planner
+from .agents.design_reviewer import make_design_reviewer, validate_review
+from .agents.design_writer import make_design_writer
+from .agents.doc_analyzer import make_doc_analyzer
+from .agents.gap_analyzer import make_gap_analyzer
+from .agents.infra_advisor import make_infra_advisor
+from .agents.latex_assembler import make_assembler
+from .agents.understanding_reviewer import make_understanding_reviewer
+from .config import build_role_llm_config
+from .logging_config import PipelineCallbacks, RichCallbacks, logger
+from .models import (
+    BuildManifest,
+    CompilationResult,
+    ConfigValidationResult,
+    DesignPlan,
+    DesignSection,
+    DocumentSummary,
+    GapReport,
+    PipelinePhase,
+    PipelineResult,
+    ProjectConfig,
+    ReviewFeedback,
+    Severity,
+    UnderstandingReport,
+    UserFeedback,
+)
+from .tools.compiler import extract_error_context, run_latexmk
+from .tools.doc_reader import chunk_all_documents, list_doc_files, read_document, total_size_kb
+from .tools.latex_builder import (
+    assemble_main_tex,
+    generate_preamble,
+    write_main_tex,
+    write_section_files,
+)
+from .tools.page_counter import count_pages
+from .tools.pandoc_converter import convert_markdown_string_to_latex
+from .tools.template_loader import get_style_max_pages, load_style_template, summarize_style
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _looks_like_latex(text: str) -> bool:
+    """Heuristic check that text is LaTeX."""
+    latex_markers = ["\\begin{", "\\section", "\\documentclass", "\\usepackage", "\\end{"]
+    return any(m in text for m in latex_markers)
+
+
+def _extract_text(response: Any) -> str:
+    """Extract text string from an AG2 chat response."""
+    if hasattr(response, "summary") and response.summary:
+        text = str(response.summary)
+    elif hasattr(response, "chat_history") and response.chat_history:
+        last = response.chat_history[-1]
+        text = last.get("content", "") if isinstance(last, dict) else str(last)
+    else:
+        text = str(response)
+
+    text = re.sub(r"```(?:latex|tex|json|markdown|md)?\n?", "", text)
+    text = re.sub(r"```\s*$", "", text)
+    return text.strip()
+
+
+def _extract_json(response: Any, model_cls: type) -> Any:
+    """Extract and validate a Pydantic model from an AG2 response."""
+    text = _extract_text(response)
+    if "{" in text:
+        json_str = text[text.find("{"):text.rfind("}") + 1]
+        try:
+            return model_cls.model_validate_json(json_str)
+        except Exception:
+            pass
+    try:
+        return model_cls.model_validate_json(text)
+    except Exception as e:
+        logger.warning("Failed to parse %s from response: %s", model_cls.__name__, e)
+        return None
+
+
+def _make_orchestrator() -> autogen.UserProxyAgent:
+    """Create a standard orchestrator agent."""
+    return autogen.UserProxyAgent(
+        name="Orchestrator",
+        human_input_mode="NEVER",
+        code_execution_config=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+class Pipeline:
+    """Orchestrates the 4-phase ML system design generation pipeline."""
+
+    def __init__(
+        self,
+        config: ProjectConfig,
+        config_dir: Path | None = None,
+        callbacks: PipelineCallbacks | None = None,
+    ) -> None:
+        self.config = config
+        self.config_dir = config_dir or Path(".")
+        self.callbacks = callbacks or RichCallbacks()
+
+        # Resolve paths relative to config dir
+        self.docs_dir = self.config_dir / config.docs_dir
+        self.output_dir = self.config_dir / config.output_dir
+
+        # Style template context
+        self.style_context: str = summarize_style(self.config.style)
+
+        # State
+        self.understanding_report: UnderstandingReport | None = None
+        self.design_plan: DesignPlan | None = None
+        self.section_markdown: dict[str, str] = {}   # section_id -> markdown
+        self.section_latex: dict[str, str] = {}       # section_id -> polished LaTeX
+        self.compilation_result: CompilationResult | None = None
+        self.manifest: BuildManifest | None = None
+        self.vector_db_dir: Path | None = None
+
+    # -----------------------------------------------------------------------
+    # Phase 1: Configuration & Validation
+    # -----------------------------------------------------------------------
+
+    def run_configuration(self) -> ConfigValidationResult:
+        """Phase 1: Validate config and fill missing fields."""
+        self.callbacks.on_phase_start("CONFIGURATION", "Validating configuration")
+
+        missing: list[str] = []
+        warnings: list[str] = []
+
+        if not self.config.project_name:
+            missing.append("project_name")
+
+        if not self.docs_dir.exists():
+            missing.append(f"docs_dir ({self.docs_dir} does not exist)")
+        elif not list_doc_files(self.docs_dir):
+            missing.append(f"No .md files found in {self.docs_dir}")
+
+        if not self.config.azure.api_key:
+            warnings.append("Azure API key not set — LLM calls will fail")
+
+        if self.config.max_pages is None:
+            default_pages = get_style_max_pages(self.config.style)
+            if default_pages:
+                self.config.max_pages = default_pages
+                warnings.append(f"max_pages defaulted to {default_pages} from style template")
+
+        valid = len(missing) == 0
+        result = ConfigValidationResult(
+            valid=valid,
+            missing_fields=missing,
+            warnings=warnings,
+        )
+
+        self.callbacks.on_phase_end("CONFIGURATION", valid)
+        return result
+
+    # -----------------------------------------------------------------------
+    # Phase 2: Document Understanding
+    # -----------------------------------------------------------------------
+
+    def run_understanding(self) -> UnderstandingReport:
+        """Phase 2: Read, summarize, gap-analyze source documents."""
+        self.callbacks.on_phase_start("UNDERSTANDING", "Analyzing source documents")
+
+        doc_files = list_doc_files(self.docs_dir)
+        if not doc_files:
+            raise FileNotFoundError(f"No .md files found in {self.docs_dir}")
+
+        # Vector DB creation if docs are large enough
+        vector_db_created = False
+        total_chunks = 0
+        if self.config.vector_db_enabled:
+            size_kb = total_size_kb(self.docs_dir)
+            if size_kb > self.config.vector_db_threshold_kb:
+                self.callbacks.on_warning(
+                    f"Docs total {size_kb:.1f}KB > threshold {self.config.vector_db_threshold_kb}KB, "
+                    f"creating vector store"
+                )
+                self.vector_db_dir = self.output_dir / ".vectordb"
+                chunks = chunk_all_documents(self.docs_dir)
+                if chunks:
+                    from .tools.vector_store import create_vector_store
+                    total_chunks = create_vector_store(chunks, self.vector_db_dir)
+                    vector_db_created = True
+
+        # DocAnalyzer: summarize each document
+        orchestrator = _make_orchestrator()
+        doc_analyzer = make_doc_analyzer(self.config)
+        summaries: list[DocumentSummary] = []
+
+        for doc_file in doc_files:
+            self.callbacks.on_section_start(doc_file.name)
+            content = read_document(doc_file)
+
+            response = orchestrator.initiate_chat(
+                doc_analyzer,
+                message=f"Analyze this document:\n\nFile: {doc_file.name}\n\n{content}",
+                max_turns=1,
+            )
+
+            summary = _extract_json(response, DocumentSummary)
+            if summary is None:
+                # Fallback
+                summary = DocumentSummary(
+                    file_path=str(doc_file),
+                    title=doc_file.stem.replace("_", " ").title(),
+                    key_topics=[],
+                    word_count=len(content.split()),
+                    summary=content[:200],
+                )
+            summaries.append(summary)
+            self.callbacks.on_section_end(doc_file.name)
+
+        # GapAnalyzer: identify gaps
+        gap_analyzer = make_gap_analyzer(self.config)
+        summaries_text = "\n\n".join(
+            f"=== {s.title} ===\n{s.summary}\nTopics: {', '.join(s.key_topics)}"
+            for s in summaries
+        )
+
+        style_info = f"Design style: {self.config.style}\n"
+        if self.config.infrastructure.provider:
+            style_info += f"Infrastructure: {self.config.infrastructure.provider}\n"
+        if self.config.tech_stack:
+            style_info += f"Tech stack: {', '.join(self.config.tech_stack)}\n"
+
+        response = orchestrator.initiate_chat(
+            gap_analyzer,
+            message=(
+                f"Analyze gaps in source material for an ML system design document.\n\n"
+                f"{style_info}\n"
+                f"Document summaries:\n{summaries_text}"
+            ),
+            max_turns=1,
+        )
+
+        gap_report = _extract_json(response, GapReport)
+        if gap_report is None:
+            gap_report = GapReport(confidence_score=0.5)
+
+        # UnderstandingReviewer: cross-check
+        understanding_reviewer = make_understanding_reviewer(self.config)
+        for round_num in range(self.config.understanding_max_rounds):
+            response = orchestrator.initiate_chat(
+                understanding_reviewer,
+                message=(
+                    f"Cross-check the document understanding (round {round_num + 1}).\n\n"
+                    f"Summaries:\n{summaries_text}\n\n"
+                    f"Gap report:\n{gap_report.model_dump_json(indent=2)}"
+                ),
+                max_turns=1,
+            )
+
+            raw_text = _extract_text(response)
+            feedback, _err = validate_review(raw_text)
+
+            if feedback is None or "no issues" in (feedback.Review or "").lower():
+                break
+
+            self.callbacks.on_warning(
+                f"UnderstandingReviewer round {round_num + 1}: {feedback.Review[:100]}..."
+            )
+
+        # Build cross-references from summaries
+        all_topics: list[str] = []
+        for s in summaries:
+            all_topics.extend(s.key_topics)
+        # Find topics that appear in multiple docs
+        from collections import Counter
+        topic_counts = Counter(all_topics)
+        cross_refs = [t for t, c in topic_counts.items() if c > 1]
+
+        self.understanding_report = UnderstandingReport(
+            documents=summaries,
+            cross_references=cross_refs,
+            gap_report=gap_report,
+            vector_db_created=vector_db_created,
+            total_chunks=total_chunks,
+        )
+
+        self.callbacks.on_phase_end("UNDERSTANDING", True)
+        return self.understanding_report
+
+    # -----------------------------------------------------------------------
+    # Phase 3: Design Generation
+    # -----------------------------------------------------------------------
+
+    def run_design(self) -> DesignPlan:
+        """Phase 3: Plan, write, review, compile the design document."""
+        if not self.understanding_report:
+            raise RuntimeError("Must run understanding phase first")
+
+        self.callbacks.on_phase_start("DESIGN", "Generating design document")
+        orchestrator = _make_orchestrator()
+
+        # Step 1: DesignPlanner produces a DesignPlan
+        planner = make_design_planner(self.config, style_context=self.style_context)
+
+        understanding_summary = ""
+        for doc in self.understanding_report.documents:
+            understanding_summary += f"- {doc.title}: {doc.summary}\n"
+
+        response = orchestrator.initiate_chat(
+            planner,
+            message=(
+                f"Create a design plan for: {self.config.project_name}\n\n"
+                f"Style: {self.config.style}\n"
+                f"Max pages: {self.config.max_pages or 'unset'}\n"
+                f"Target audience: {self.config.target_audience}\n"
+                f"Tech stack: {', '.join(self.config.tech_stack) or 'unspecified'}\n"
+                f"Infrastructure: {self.config.infrastructure.provider or 'unspecified'}\n"
+                f"Constraints: {', '.join(self.config.constraints) or 'none'}\n\n"
+                f"Source document summaries:\n{understanding_summary}\n\n"
+                f"Gap report confidence: {self.understanding_report.gap_report.confidence_score}\n"
+                f"Cross-references: {', '.join(self.understanding_report.cross_references)}"
+            ),
+            max_turns=1,
+        )
+
+        plan = _extract_json(response, DesignPlan)
+        if plan is None:
+            # Fallback: create plan from style template
+            logger.warning("LLM planning failed, creating plan from style template")
+            template = load_style_template(self.config.style)
+            sections = []
+            for s in template.get("sections", []):
+                sections.append(DesignSection(
+                    section_id=s["id"],
+                    title=s["title"],
+                    content_guidance=s.get("guidance", ""),
+                    estimated_pages=s.get("estimated_pages", 1.0),
+                ))
+            plan = DesignPlan(
+                title=self.config.project_name,
+                style=self.config.style,
+                sections=sections,
+                total_estimated_pages=sum(s.estimated_pages for s in sections),
+                page_budget=self.config.max_pages,
+            )
+
+        self.design_plan = plan
+
+        # Step 2: Write each section
+        writer = make_design_writer(self.config)
+
+        for section in plan.sections:
+            self.callbacks.on_section_start(section.section_id)
+
+            # Build context for writer
+            context = self._build_section_context(section)
+
+            response = orchestrator.initiate_chat(
+                writer,
+                message=(
+                    f"Write the '{section.title}' section for the ML system design document.\n\n"
+                    f"Content guidance: {section.content_guidance}\n"
+                    f"Estimated pages: {section.estimated_pages}\n"
+                    f"Target audience: {self.config.target_audience}\n\n"
+                    f"Context from source documents:\n{context}"
+                ),
+                max_turns=1,
+            )
+
+            markdown = _extract_text(response)
+            self.section_markdown[section.section_id] = markdown
+
+            # Step 3: Review section
+            review_feedback = self._review_section(section.section_id, markdown, orchestrator)
+
+            # Step 4: If issues found, rewrite
+            if review_feedback and any(
+                r.severity in (Severity.ERROR, Severity.CRITICAL) for r in review_feedback
+            ):
+                feedback_text = "\n".join(f"[{r.Reviewer}]: {r.Review}" for r in review_feedback)
+                fix_writer = make_design_writer(self.config)
+                fix_response = orchestrator.initiate_chat(
+                    fix_writer,
+                    message=(
+                        f"Revise the '{section.title}' section based on reviewer feedback.\n\n"
+                        f"FEEDBACK:\n{feedback_text}\n\n"
+                        f"ORIGINAL SECTION:\n{markdown}"
+                    ),
+                    max_turns=1,
+                )
+                revised = _extract_text(fix_response)
+                if revised:
+                    self.section_markdown[section.section_id] = revised
+
+            self.callbacks.on_section_end(section.section_id)
+
+        # Step 5: Cross-review
+        self._cross_review(orchestrator)
+
+        # Step 6: Convert markdown -> LaTeX
+        self._convert_and_compile(orchestrator)
+
+        self.callbacks.on_phase_end("DESIGN", True)
+        return plan
+
+    def _build_section_context(self, section: DesignSection) -> str:
+        """Build context for section writing from understanding report + vector DB."""
+        parts: list[str] = []
+
+        # Include relevant document summaries
+        if self.understanding_report:
+            for doc in self.understanding_report.documents:
+                parts.append(f"--- {doc.title} ---\n{doc.summary}")
+
+        # Query vector DB for relevant chunks
+        if self.vector_db_dir:
+            try:
+                from .tools.vector_store import query_vector_store
+                query = f"{section.title} {section.content_guidance}"
+                results = query_vector_store(query, self.vector_db_dir, n_results=3)
+                if results:
+                    parts.append("\n--- Relevant source excerpts ---")
+                    for r in results:
+                        parts.append(f"[{r['file_path']}]\n{r['text'][:500]}")
+            except Exception as e:
+                logger.warning("Vector DB query failed: %s", e)
+
+        # Include infrastructure and tech context
+        if self.config.infrastructure.provider:
+            parts.append(
+                f"\nInfrastructure: {self.config.infrastructure.provider}\n"
+                f"Compute: {', '.join(self.config.infrastructure.compute)}\n"
+                f"Storage: {', '.join(self.config.infrastructure.storage)}\n"
+                f"Services: {', '.join(self.config.infrastructure.services)}"
+            )
+        if self.config.tech_stack:
+            parts.append(f"Tech stack: {', '.join(self.config.tech_stack)}")
+        if self.config.constraints:
+            parts.append(f"Constraints: {', '.join(self.config.constraints)}")
+
+        return "\n\n".join(parts) if parts else "(No additional context available)"
+
+    def _review_section(
+        self,
+        section_id: str,
+        markdown: str,
+        orchestrator: autogen.UserProxyAgent,
+    ) -> list[ReviewFeedback]:
+        """Run DesignReviewer on a section."""
+        collected: list[ReviewFeedback] = []
+
+        reviewer = make_design_reviewer(self.config)
+        if reviewer is None:
+            return collected
+
+        self.callbacks.on_section_review(section_id, "DesignReviewer")
+        try:
+            response = orchestrator.initiate_chat(
+                reviewer,
+                message=(
+                    f"Review this design section (section_id: {section_id}):\n\n{markdown}"
+                ),
+                max_turns=1,
+            )
+            raw = _extract_text(response)
+            feedback, _err = validate_review(raw)
+            if feedback:
+                collected.append(feedback)
+        except Exception as e:
+            self.callbacks.on_warning(f"DesignReviewer skipped for {section_id}: {e}")
+
+        return collected
+
+    def _cross_review(self, orchestrator: autogen.UserProxyAgent) -> None:
+        """Run ConsistencyChecker and InfraAdvisor across all sections."""
+        # Build section summaries
+        summaries = "\n\n".join(
+            f"=== {sid} ===\n{md[:300]}..."
+            for sid, md in self.section_markdown.items()
+        )
+
+        # ConsistencyChecker
+        checker = make_consistency_checker(self.config)
+        if checker:
+            self.callbacks.on_section_review("all", "ConsistencyChecker")
+            try:
+                response = orchestrator.initiate_chat(
+                    checker,
+                    message=f"Review all section summaries for consistency:\n\n{summaries}",
+                    max_turns=1,
+                )
+                raw = _extract_text(response)
+                feedback, _err = validate_review(raw)
+                if feedback and "no issues" not in (feedback.Review or "").lower():
+                    self.callbacks.on_warning(f"ConsistencyChecker: {feedback.Review[:150]}")
+                    self._apply_cross_review_fixes(feedback, orchestrator)
+            except Exception as e:
+                self.callbacks.on_warning(f"ConsistencyChecker skipped: {e}")
+
+        # InfraAdvisor
+        advisor = make_infra_advisor(self.config)
+        if advisor:
+            self.callbacks.on_section_review("all", "InfraAdvisor")
+            try:
+                infra_context = (
+                    f"Infrastructure: {self.config.infrastructure.provider}\n"
+                    f"Compute: {', '.join(self.config.infrastructure.compute)}\n"
+                    f"Tech stack: {', '.join(self.config.tech_stack)}\n\n"
+                )
+                response = orchestrator.initiate_chat(
+                    advisor,
+                    message=(
+                        f"Review design for infrastructure feasibility:\n\n"
+                        f"{infra_context}{summaries}"
+                    ),
+                    max_turns=1,
+                )
+                raw = _extract_text(response)
+                feedback, _err = validate_review(raw)
+                if feedback and "no issues" not in (feedback.Review or "").lower():
+                    self.callbacks.on_warning(f"InfraAdvisor: {feedback.Review[:150]}")
+                    self._apply_cross_review_fixes(feedback, orchestrator)
+            except Exception as e:
+                self.callbacks.on_warning(f"InfraAdvisor skipped: {e}")
+
+    def _apply_cross_review_fixes(
+        self,
+        feedback: ReviewFeedback,
+        orchestrator: autogen.UserProxyAgent,
+    ) -> None:
+        """Apply fixes from cross-review feedback to affected sections."""
+        affected = feedback.affected_sections
+        if not affected:
+            # Try to extract section IDs from the review text
+            for sid in self.section_markdown:
+                if sid in feedback.Review:
+                    affected.append(sid)
+
+        for sid in affected:
+            if sid not in self.section_markdown:
+                continue
+            try:
+                fix_writer = make_design_writer(self.config)
+                response = orchestrator.initiate_chat(
+                    fix_writer,
+                    message=(
+                        f"Revise this section based on cross-review feedback.\n\n"
+                        f"FEEDBACK: {feedback.Review}\n\n"
+                        f"SECTION ({sid}):\n{self.section_markdown[sid]}"
+                    ),
+                    max_turns=1,
+                )
+                revised = _extract_text(response)
+                if revised:
+                    self.section_markdown[sid] = revised
+            except Exception as e:
+                self.callbacks.on_warning(f"Cross-review fix skipped for {sid}: {e}")
+
+    def _convert_and_compile(self, orchestrator: autogen.UserProxyAgent) -> None:
+        """Convert markdown sections to LaTeX and compile."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Convert each section: markdown -> LaTeX via Pandoc -> LLM polish
+        assembler = make_assembler(self.config)
+
+        for section_id, markdown in self.section_markdown.items():
+            self.callbacks.on_section_start(f"convert:{section_id}")
+
+            # Pandoc conversion
+            pandoc_latex = convert_markdown_string_to_latex(markdown, annotate=True)
+
+            # LLM polish
+            try:
+                response = orchestrator.initiate_chat(
+                    assembler,
+                    message=(
+                        f"Polish this Pandoc-converted LaTeX for the section '{section_id}'. "
+                        f"Only modify text between SAFE_ZONE markers.\n\n{pandoc_latex}"
+                    ),
+                    max_turns=1,
+                )
+                polished = _extract_text(response)
+                if polished and _looks_like_latex(polished):
+                    self.section_latex[section_id] = polished
+                else:
+                    self.section_latex[section_id] = pandoc_latex
+            except Exception as e:
+                self.callbacks.on_warning(f"LaTeX polish skipped for {section_id}: {e}")
+                self.section_latex[section_id] = pandoc_latex
+
+            self.callbacks.on_section_end(f"convert:{section_id}")
+
+        # Assemble main.tex
+        section_ids = list(self.section_latex.keys())
+        preamble = generate_preamble(title=self.config.project_name)
+        main_tex = assemble_main_tex(preamble, section_ids, title=self.config.project_name)
+        write_main_tex(main_tex, self.output_dir)
+        write_section_files(self.section_latex, self.output_dir)
+
+        # Compile-fix loop
+        for attempt in range(1, self.config.compile_max_attempts + 1):
+            self.callbacks.on_compile_attempt(attempt, self.config.compile_max_attempts)
+
+            result = run_latexmk(self.output_dir)
+            if result.success:
+                self.compilation_result = result
+                break
+
+            # Don't try LLM fixes for environment errors
+            _unfixable = {"latexmk not found", "not found on PATH", "timed out"}
+            if any(any(u in err.message for u in _unfixable) for err in result.errors):
+                self.compilation_result = result
+                break
+
+            if attempt < self.config.compile_max_attempts:
+                for section_id in list(self.section_latex.keys()):
+                    section_content = self.section_latex[section_id]
+                    error_ctx = extract_error_context(
+                        result, section_content,
+                        section_file=f"sections/{section_id}.tex",
+                    )
+                    if "No errors found" in error_ctx:
+                        continue
+                    try:
+                        fix_response = orchestrator.initiate_chat(
+                            assembler,
+                            message=(
+                                f"Fix LaTeX compilation errors in section {section_id}. "
+                                f"Return the COMPLETE corrected section.\n"
+                                f"Do NOT add \\usepackage commands.\n\n"
+                                f"Errors:\n{error_ctx}\n\n"
+                                f"Section content:\n{section_content}"
+                            ),
+                            max_turns=1,
+                        )
+                        new_latex = _extract_text(fix_response)
+                        if new_latex and _looks_like_latex(new_latex):
+                            self.section_latex[section_id] = new_latex
+                    except Exception as e:
+                        self.callbacks.on_warning(f"Compile-fix skipped for {section_id}: {e}")
+
+                write_section_files(self.section_latex, self.output_dir)
+
+            self.compilation_result = result
+
+    # -----------------------------------------------------------------------
+    # Phase 4: User Review
+    # -----------------------------------------------------------------------
+
+    def run_user_review(self) -> UserFeedback:
+        """Phase 4: Present draft to user and collect feedback."""
+        self.callbacks.on_phase_start("USER_REVIEW", "Presenting draft for review")
+
+        if not self.design_plan:
+            raise RuntimeError("Must run design phase first")
+
+        feedback = self.callbacks.on_plan_review(self.design_plan)
+
+        if feedback.action == "revise" and feedback.comments:
+            self._apply_user_revisions(feedback)
+
+        self.callbacks.on_phase_end("USER_REVIEW", feedback.action != "abort")
+        return feedback
+
+    def _apply_user_revisions(self, feedback: UserFeedback) -> None:
+        """Apply user revision feedback to affected sections."""
+        orchestrator = _make_orchestrator()
+
+        # Section-specific comments
+        for sid, comment in feedback.section_comments.items():
+            if sid in self.section_markdown:
+                writer = make_design_writer(self.config)
+                try:
+                    response = orchestrator.initiate_chat(
+                        writer,
+                        message=(
+                            f"Revise this section based on user feedback.\n\n"
+                            f"USER FEEDBACK: {comment}\n\n"
+                            f"SECTION ({sid}):\n{self.section_markdown[sid]}"
+                        ),
+                        max_turns=1,
+                    )
+                    revised = _extract_text(response)
+                    if revised:
+                        self.section_markdown[sid] = revised
+                except Exception as e:
+                    self.callbacks.on_warning(f"Revision skipped for {sid}: {e}")
+
+        # General comments: apply to all sections
+        if feedback.comments and not feedback.section_comments:
+            for sid in list(self.section_markdown.keys()):
+                writer = make_design_writer(self.config)
+                try:
+                    response = orchestrator.initiate_chat(
+                        writer,
+                        message=(
+                            f"Revise this section based on general user feedback.\n\n"
+                            f"USER FEEDBACK: {feedback.comments}\n\n"
+                            f"SECTION ({sid}):\n{self.section_markdown[sid]}"
+                        ),
+                        max_turns=1,
+                    )
+                    revised = _extract_text(response)
+                    if revised:
+                        self.section_markdown[sid] = revised
+                except Exception as e:
+                    self.callbacks.on_warning(f"Revision skipped for {sid}: {e}")
+
+        # Re-convert and re-compile
+        self._convert_and_compile(orchestrator)
+
+    # -----------------------------------------------------------------------
+    # Finalization
+    # -----------------------------------------------------------------------
+
+    def run_finalization(self) -> BuildManifest:
+        """Generate manifest and final verification."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        warnings: list[str] = []
+        if self.compilation_result and not self.compilation_result.success:
+            warnings.append("Compilation did not succeed — review output carefully")
+
+        section_file_list = [f"sections/{sid}.tex" for sid in self.section_latex]
+
+        self.manifest = BuildManifest(
+            project_name=self.config.project_name,
+            output_dir=str(self.output_dir),
+            section_files=section_file_list,
+            pdf_file=self.compilation_result.pdf_path if self.compilation_result else None,
+            source_files=[str(f) for f in list_doc_files(self.docs_dir)],
+            style_used=self.config.style,
+            compilation_attempts=self.config.compile_max_attempts,
+            page_count=self.compilation_result.page_count if self.compilation_result else None,
+            warnings=warnings,
+        )
+
+        manifest_path = self.output_dir / "manifest.json"
+        manifest_path.write_text(
+            self.manifest.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        logger.info("Wrote %s", manifest_path)
+
+        return self.manifest
+
+    # -----------------------------------------------------------------------
+    # Full pipeline
+    # -----------------------------------------------------------------------
+
+    def run(self) -> PipelineResult:
+        """Run the full 4-phase pipeline."""
+        errors: list[str] = []
+        phases: list[PipelinePhase] = []
+
+        try:
+            validation = self.run_configuration()
+            phases.append(PipelinePhase.CONFIGURATION)
+            if not validation.valid:
+                return PipelineResult(
+                    success=False,
+                    errors=[f"Config validation failed: {', '.join(validation.missing_fields)}"],
+                    phases_completed=phases,
+                )
+
+            self.run_understanding()
+            phases.append(PipelinePhase.UNDERSTANDING)
+
+            self.run_design()
+            phases.append(PipelinePhase.DESIGN)
+
+            # Plan approval gate
+            for _ in range(self.config.design_revision_max_rounds):
+                feedback = self.run_user_review()
+                phases.append(PipelinePhase.USER_REVIEW)
+
+                if feedback.action == "approve":
+                    break
+                elif feedback.action == "abort":
+                    return PipelineResult(
+                        success=False,
+                        understanding_report=self.understanding_report,
+                        design_plan=self.design_plan,
+                        compilation_result=self.compilation_result,
+                        errors=["Pipeline aborted by user during review"],
+                        phases_completed=phases,
+                    )
+
+            self.run_finalization()
+
+        except Exception as e:
+            logger.exception("Pipeline failed")
+            errors.append(str(e))
+
+        success = (
+            self.compilation_result is not None
+            and self.compilation_result.success
+        )
+
+        return PipelineResult(
+            success=success,
+            understanding_report=self.understanding_report,
+            design_plan=self.design_plan,
+            compilation_result=self.compilation_result,
+            output_dir=str(self.output_dir),
+            errors=errors,
+            phases_completed=phases,
+        )
+
+    # -----------------------------------------------------------------------
+    # Partial runs (for CLI subcommands)
+    # -----------------------------------------------------------------------
+
+    def run_understand_only(self) -> UnderstandingReport:
+        """Run only Phase 1 + 2 (config + understanding)."""
+        self.run_configuration()
+        return self.run_understanding()
+
+    def run_plan_only(self) -> tuple[UnderstandingReport, DesignPlan]:
+        """Run Phase 1 + 2 + plan step of Phase 3."""
+        self.run_configuration()
+        report = self.run_understanding()
+        plan = self.run_design()
+        return report, plan

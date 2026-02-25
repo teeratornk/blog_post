@@ -1,0 +1,29 @@
+name: "Anthropic Design Doc"
+description: "Concise design document focused on context, goals, design, risks, and open questions"
+max_pages_default: 6
+sections:
+  - id: context
+    title: "Context"
+    guidance: "Why does this project exist? What problem are we solving? What is the current state? Include relevant metrics and prior work."
+    estimated_pages: 0.7
+  - id: goals
+    title: "Goals"
+    guidance: "What does success look like? Define measurable objectives. Include both ML metrics and business metrics."
+    estimated_pages: 0.4
+  - id: design
+    title: "Design"
+    guidance: "Detailed ML system design. Cover data pipeline, model architecture, training strategy, serving infrastructure, and monitoring. Be concrete about implementation choices."
+    estimated_pages: 2.5
+  - id: risks
+    title: "Risks"
+    guidance: "What could go wrong? Cover technical risks, safety risks, operational risks, and timeline risks. For each risk, propose a mitigation strategy."
+    estimated_pages: 0.8
+  - id: open_questions
+    title: "Open Questions"
+    guidance: "What decisions remain unmade? What information is needed? Who needs to weigh in? Categorize by blocking vs non-blocking."
+    estimated_pages: 0.4
+  - id: appendix
+    title: "Appendix"
+    guidance: "Supporting data, detailed diagrams, cost estimates, API specifications."
+    estimated_pages: 1.2
+    optional: true

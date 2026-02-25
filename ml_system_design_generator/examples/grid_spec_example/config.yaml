@@ -1,0 +1,66 @@
+defaults:
+  - mlsd_schema
+  - _self_
+
+project_name: "ML-Powered Grid Operations Decision Support System"
+style: amazon_6page
+max_pages: 6
+docs_dir: ../../docs/grid_spec/
+output_dir: output/
+
+infrastructure:
+  provider: azure
+  compute:
+    - gpu_a100
+    - cpu_cluster
+  storage:
+    - blob_storage
+    - cosmos_db
+  services:
+    - kubernetes
+    - azure_ml
+
+tech_stack:
+  - python
+  - pytorch
+  - fastapi
+  - kubernetes
+  - azure_ml
+
+team_size: 5
+timeline: "6 months"
+constraints:
+  - "Latency < 500ms for real-time predictions"
+  - "Must handle extreme weather events"
+  - "NERC CIP compliance"
+target_audience: engineering
+
+azure:
+  api_key: "${oc.env:AZURE_OPENAI_API_KEY}"
+  api_version: "${oc.env:AZURE_OPENAI_API_VERSION}"
+  endpoint: "${oc.env:AZURE_OPENAI_ENDPOINT}"
+
+models:
+  default: gpt-5.2
+  writer: gpt-5.2
+  reviewer: gpt-5.2
+
+understanding_max_rounds: 2
+design_review_max_turns: 2
+design_revision_max_rounds: 2
+compile_max_attempts: 3
+vector_db_enabled: true
+timeout: 120
+seed: 42
+
+enabled_reviewers:
+  DesignReviewer: true
+  ConsistencyChecker: true
+  InfraAdvisor: true
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

@@ -1,0 +1,16 @@
+name: "Amazon 2-Page PR/FAQ"
+description: "Press Release / Frequently Asked Questions format for concise proposals"
+max_pages_default: 2
+sections:
+  - id: press_release
+    title: "Press Release"
+    guidance: "Write a future-dated press release announcing the ML system as if it were launched. Include: headline, subheadline, problem statement, solution summary, customer quote, call to action."
+    estimated_pages: 0.7
+  - id: faq_external
+    title: "External FAQ"
+    guidance: "5-7 questions a customer or end user would ask. Cover: what it does, how to use it, performance expectations, data requirements, cost."
+    estimated_pages: 0.5
+  - id: faq_internal
+    title: "Internal FAQ"
+    guidance: "5-7 questions stakeholders and engineers would ask. Cover: technical approach, infrastructure needs, timeline, team size, risks, dependencies, cost estimates."
+    estimated_pages: 0.8

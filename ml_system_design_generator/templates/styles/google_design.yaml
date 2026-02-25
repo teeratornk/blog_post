@@ -1,0 +1,38 @@
+name: "Google Design Doc"
+description: "Standard Google-style design document with context, goals, and detailed design"
+max_pages_default: 8
+sections:
+  - id: context
+    title: "Context and Background"
+    guidance: "Provide context for the project. What is the current state? What problem are we solving? Include relevant data and prior work."
+    estimated_pages: 0.8
+  - id: goals
+    title: "Goals and Non-Goals"
+    guidance: "Clearly separate what this system will and will not do. Goals should be measurable. Non-goals clarify scope boundaries."
+    estimated_pages: 0.5
+  - id: design
+    title: "Detailed Design"
+    guidance: "Core ML system architecture. Cover: data pipeline, feature engineering, model architecture, training infrastructure, serving infrastructure, monitoring. Include system diagrams."
+    estimated_pages: 3.0
+  - id: alternatives
+    title: "Alternatives Considered"
+    guidance: "List alternative approaches with pros/cons. Explain the rationale for the chosen design."
+    estimated_pages: 1.0
+  - id: cross_cutting
+    title: "Cross-Cutting Concerns"
+    guidance: "Address security, privacy, scalability, reliability, cost, compliance, and accessibility concerns."
+    estimated_pages: 1.0
+  - id: timeline
+    title: "Timeline and Milestones"
+    guidance: "Phased implementation plan with milestones, dependencies, and resource requirements."
+    estimated_pages: 0.5
+  - id: open_questions
+    title: "Open Questions"
+    guidance: "List unresolved questions that need answers before or during implementation."
+    estimated_pages: 0.3
+    optional: true
+  - id: appendix
+    title: "Appendix"
+    guidance: "Detailed data schemas, API specifications, benchmarks, cost projections."
+    estimated_pages: 0.9
+    optional: true
