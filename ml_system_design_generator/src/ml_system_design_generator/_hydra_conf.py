@@ -20,6 +20,14 @@ class AzureConf:
 
 
 @dataclass
+class ModelEndpointOverrideConf:
+    endpoint: str = ""
+    api_key: str | None = None
+    api_version: str | None = None
+    api_type: str | None = None
+
+
+@dataclass
 class ModelConf:
     default: str = "gpt-5.2"
     analyzer: str | None = None
@@ -27,6 +35,7 @@ class ModelConf:
     reviewer: str | None = None
     planner: str | None = None
     advisor: str | None = None
+    overrides: dict[str, ModelEndpointOverrideConf] = field(default_factory=dict)
 
 
 @dataclass
@@ -48,6 +57,7 @@ class MlsdConf:
 
     # --- ProjectConfig fields ---
     project_name: str = "ml-system-design"
+    author: str = ""
     style: str = "amazon_6page"
     max_pages: int | None = None
     docs_dir: str = "docs/"
@@ -59,7 +69,7 @@ class MlsdConf:
     team_size: int | None = None
     timeline: str | None = None
     constraints: list[str] = field(default_factory=list)
-    target_audience: str = "engineering"
+    target_audience: str = "leadership"
 
     # Azure OpenAI
     azure: AzureConf = field(default_factory=AzureConf)
@@ -69,6 +79,7 @@ class MlsdConf:
     understanding_max_rounds: int = 3
     design_review_max_turns: int = 3
     design_revision_max_rounds: int = 3
+    writing_review_max_rounds: int = 2
     compile_max_attempts: int = 3
     vector_db_enabled: bool = True
     vector_db_threshold_kb: int = 50
@@ -80,15 +91,16 @@ class MlsdConf:
     feasibility_max_rounds: int = 2
 
     # Page budget & supplementary
-    supplementary_mode: str = "disabled"
+    supplementary_mode: str = "auto"
     supplementary_threshold: float = 1.3
     max_plan_revisions: int = 3
-    words_per_page: int = 500
+    words_per_page: int = 350
 
     enabled_reviewers: dict[str, bool] = field(default_factory=lambda: {
         "DesignReviewer": True,
         "ConsistencyChecker": True,
         "InfraAdvisor": True,
+        "QualityReviewer": True,
     })
 
 

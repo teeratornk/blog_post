@@ -85,7 +85,21 @@ def _run_mode(cfg: DictConfig) -> None:
             console.print(f"  Output: {result.output_dir}")
         if result.compilation_result and result.compilation_result.pdf_path:
             console.print(f"  PDF: {result.compilation_result.pdf_path}")
-            console.print(f"  Pages: {result.compilation_result.page_count or 'unknown'}")
+            pc = result.compilation_result.page_count
+            if (
+                result.split_decision
+                and result.split_decision.supplementary_plan
+                and result.split_decision.action == "split"
+            ):
+                manifest = pipeline.manifest
+                main_pc = manifest.main_page_count if manifest else pc
+                supp_pc = (pc - main_pc) if (pc and main_pc) else None
+                if supp_pc:
+                    console.print(f"  Pages: {main_pc} main + {supp_pc} appendix ({pc} total)")
+                else:
+                    console.print(f"  Pages: {pc or 'unknown'}")
+            else:
+                console.print(f"  Pages: {pc or 'unknown'}")
     else:
         console.print("\n[bold red]Pipeline failed.[/]")
         for err in result.errors:

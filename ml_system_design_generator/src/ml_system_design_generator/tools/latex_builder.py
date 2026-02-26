@@ -35,14 +35,19 @@ def _load_preamble_template(template_file: str | None = None) -> str:
     raise FileNotFoundError(f"Preamble template not found: {default}")
 
 
-def generate_preamble(title: str = "", template_file: str | None = None) -> str:
+def generate_preamble(
+    title: str = "",
+    author: str = "",
+    template_file: str | None = None,
+) -> str:
     """Generate the document preamble from template.
 
-    Replaces {{TITLE}} placeholder with the given title.
+    Replaces ``{{TITLE}}`` and ``{{AUTHOR}}`` placeholders.
     """
     raw = _load_preamble_template(template_file)
     if title:
         raw = raw.replace("{{TITLE}}", title)
+    raw = raw.replace("{{AUTHOR}}", author or "ML System Design Generator")
     return raw
 
 
@@ -72,6 +77,7 @@ def assemble_main_tex(
 
     if title:
         parts.append("\\maketitle")
+        parts.append("\\thispagestyle{fancy}")
         parts.append("")
 
     for section_id in main_ids:
@@ -124,6 +130,17 @@ def write_supplementary_tex(content: str, output_dir: Path) -> None:
     logger.info("Wrote %s", path)
 
 
+def _strip_safe_zone_markers(latex: str) -> str:
+    """Remove SAFE_ZONE annotation markers from final output."""
+    lines = []
+    for line in latex.splitlines():
+        stripped = line.strip()
+        if stripped in ("%% SAFE_ZONE_START", "%% SAFE_ZONE_END"):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def write_section_files(section_latex: dict[str, str], output_dir: Path) -> None:
     """Write individual section .tex files to output_dir/sections/."""
     sections_dir = output_dir / "sections"
@@ -131,7 +148,7 @@ def write_section_files(section_latex: dict[str, str], output_dir: Path) -> None
 
     for section_id, latex in section_latex.items():
         path = sections_dir / f"{section_id}.tex"
-        path.write_text(latex, encoding="utf-8")
+        path.write_text(_strip_safe_zone_markers(latex), encoding="utf-8")
         logger.info("Wrote %s", path)
 
 

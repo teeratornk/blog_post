@@ -36,6 +36,29 @@ documents. Add domain-specific guidance in content_guidance.
 """
 
 
+_AUDIENCE_GUIDANCE = {
+    "leadership": (
+        "TARGET AUDIENCE: leadership\n"
+        "Write for senior leadership. Keep sections brief and outcome-focused.\n"
+        "Minimize subsections. Focus on business impact, key decisions, and risks.\n"
+        "Omit low-level implementation details — reference a Technical Supplement.\n"
+        "Allocate page budgets tightly: the Approach section should be at most 1.5\n"
+        "pages (use tables for architecture summaries instead of verbose prose).\n"
+        "Prefer fewer, denser pages over splitting content into an appendix.\n\n"
+    ),
+    "mixed": (
+        "TARGET AUDIENCE: mixed\n"
+        "Balanced depth suitable for mixed engineering/leadership audience.\n\n"
+    ),
+    "engineering": (
+        "TARGET AUDIENCE: engineering\n"
+        "Write for engineering teams. Include comprehensive subsections.\n"
+        "Add implementation specifics, edge cases, failure modes, code-level\n"
+        "architecture, API contracts, and detailed data schemas.\n\n"
+    ),
+}
+
+
 def make_design_planner(
     config: ProjectConfig,
     *,
@@ -50,6 +73,8 @@ def make_design_planner(
         )
     else:
         block = ""
+
+    block += _AUDIENCE_GUIDANCE.get(config.target_audience, _AUDIENCE_GUIDANCE["mixed"])
 
     agent = autogen.AssistantAgent(
         name="DesignPlanner",

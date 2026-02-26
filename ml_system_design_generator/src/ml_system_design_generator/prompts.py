@@ -102,7 +102,7 @@ def prompt_target_audience() -> str:
     choice = Prompt.ask(
         "\n[bold]Target audience[/]",
         choices=audiences,
-        default="engineering",
+        default="leadership",
     )
     return choice
 

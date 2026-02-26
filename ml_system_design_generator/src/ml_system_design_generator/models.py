@@ -48,6 +48,14 @@ class AzureConfig(BaseModel):
     endpoint: str = Field(default="", description="Azure endpoint URL")
 
 
+class ModelEndpointOverride(BaseModel):
+    """Per-model endpoint override for models on different Azure resources."""
+    endpoint: str = Field(description="Azure endpoint or base URL for this model")
+    api_key: str | None = Field(default=None, description="API key (falls back to azure.api_key)")
+    api_version: str | None = Field(default=None, description="API version (falls back to azure.api_version)")
+    api_type: str | None = Field(default=None, description="Force api_type: 'anthropic', 'azure', or None for auto-detect")
+
+
 class ModelConfig(BaseModel):
     """LLM model configuration per role."""
     default: str = Field(default="gpt-5.2", description="Default model")
@@ -56,6 +64,10 @@ class ModelConfig(BaseModel):
     reviewer: str | None = Field(default=None)
     planner: str | None = Field(default=None)
     advisor: str | None = Field(default=None)
+    overrides: dict[str, ModelEndpointOverride] = Field(
+        default_factory=dict,
+        description="Per-model endpoint overrides keyed by model name",
+    )
 
 
 class InfrastructureConfig(BaseModel):
@@ -185,6 +197,7 @@ class DesignSection(BaseModel):
     depends_on: list[str] = Field(default_factory=list, description="Other section_ids")
     priority: int = Field(default=1, description="1=highest priority, higher=lower priority")
     target_word_count: int | None = Field(default=None, description="Target word count for this section")
+    actual_word_count: int | None = Field(default=None, description="Actual word count after writing")
 
 
 class DesignPlan(BaseModel):
@@ -296,6 +309,7 @@ class BuildManifest(BaseModel):
     compilation_attempts: int = 0
     review_rounds: int = 0
     page_count: int | None = None
+    main_page_count: int | None = None
     warnings: list[str] = Field(default_factory=list)
     supplementary_tex: str | None = None
     supplementary_pdf: str | None = None
@@ -328,6 +342,7 @@ class PipelineResult(BaseModel):
 class ProjectConfig(BaseModel):
     """Full project configuration."""
     project_name: str = Field(default="ml-system-design")
+    author: str = Field(default="", description="Author line for the document title page")
     style: str = Field(default="amazon_6page", description="Design doc style template")
     max_pages: int | None = Field(default=None, description="Target page count")
     docs_dir: str = Field(default="docs/", description="Directory containing source markdown docs")
@@ -339,7 +354,7 @@ class ProjectConfig(BaseModel):
     team_size: int | None = None
     timeline: str | None = None
     constraints: list[str] = Field(default_factory=list)
-    target_audience: str = Field(default="engineering", description="engineering | leadership | mixed")
+    target_audience: str = Field(default="leadership", description="engineering | leadership | mixed")
 
     # Azure OpenAI
     azure: AzureConfig = Field(default_factory=AzureConfig)
@@ -349,6 +364,7 @@ class ProjectConfig(BaseModel):
     understanding_max_rounds: int = Field(default=3)
     design_review_max_turns: int = Field(default=3)
     design_revision_max_rounds: int = Field(default=3)
+    writing_review_max_rounds: int = Field(default=2, description="Max outer write-review loop iterations")
     compile_max_attempts: int = Field(default=3)
     vector_db_enabled: bool = Field(default=True)
     vector_db_threshold_kb: int = Field(default=50)
@@ -361,7 +377,7 @@ class ProjectConfig(BaseModel):
 
     # Page budget & supplementary
     supplementary_mode: str = Field(
-        default="disabled",
+        default="auto",
         description="disabled | auto | appendix | standalone",
     )
     supplementary_threshold: float = Field(
@@ -369,7 +385,7 @@ class ProjectConfig(BaseModel):
         description="Ratio of actual/budget pages that triggers supplementary (for auto mode)",
     )
     max_plan_revisions: int = Field(default=3, description="Max plan revision rounds")
-    words_per_page: int = Field(default=500, description="Estimated words per page for budget")
+    words_per_page: int = Field(default=350, description="Estimated words per page for budget")
 
     # Enabled reviewers
     enabled_reviewers: dict[str, bool] = Field(
@@ -377,5 +393,6 @@ class ProjectConfig(BaseModel):
             "DesignReviewer": True,
             "ConsistencyChecker": True,
             "InfraAdvisor": True,
+            "QualityReviewer": True,
         }
     )

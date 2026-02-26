@@ -339,14 +339,38 @@ class TestBuildManifestExtended:
         assert manifest.supplementary_tex is None
         assert manifest.supplementary_sections == []
 
+    def test_main_page_count_default_none(self):
+        manifest = BuildManifest(project_name="test", output_dir="/tmp/out")
+        assert manifest.main_page_count is None
+
+    def test_main_page_count_set(self):
+        manifest = BuildManifest(
+            project_name="test",
+            output_dir="/tmp/out",
+            page_count=10,
+            main_page_count=6,
+        )
+        assert manifest.main_page_count == 6
+        assert manifest.page_count == 10
+
+
+class TestProjectConfigAuthor:
+    def test_author_default_empty(self):
+        config = ProjectConfig()
+        assert config.author == ""
+
+    def test_author_set(self):
+        config = ProjectConfig(author="Siemens Energy AI Lab")
+        assert config.author == "Siemens Energy AI Lab"
+
 
 class TestProjectConfigExtended:
     def test_supplementary_defaults(self):
         config = ProjectConfig()
-        assert config.supplementary_mode == "disabled"
+        assert config.supplementary_mode == "auto"
         assert config.supplementary_threshold == 1.3
         assert config.max_plan_revisions == 3
-        assert config.words_per_page == 500
+        assert config.words_per_page == 350
 
     def test_custom_supplementary(self):
         config = ProjectConfig(
@@ -586,3 +610,169 @@ class TestProjectConfigOpportunity:
         config = ProjectConfig(max_opportunities=10, feasibility_max_rounds=4)
         assert config.max_opportunities == 10
         assert config.feasibility_max_rounds == 4
+
+
+class TestDesignSectionActualWordCount:
+    def test_actual_word_count_default_none(self):
+        section = DesignSection(section_id="test", title="Test")
+        assert section.actual_word_count is None
+
+    def test_actual_word_count_set(self):
+        section = DesignSection(section_id="test", title="Test", actual_word_count=350)
+        assert section.actual_word_count == 350
+
+
+class TestQualityReviewerConfig:
+    def test_quality_reviewer_in_default_enabled_reviewers(self):
+        config = ProjectConfig()
+        assert config.enabled_reviewers.get("QualityReviewer") is True
+
+    def test_quality_reviewer_can_be_disabled(self):
+        config = ProjectConfig(
+            enabled_reviewers={
+                "DesignReviewer": True,
+                "ConsistencyChecker": True,
+                "InfraAdvisor": True,
+                "QualityReviewer": False,
+            }
+        )
+        assert config.enabled_reviewers["QualityReviewer"] is False
+
+
+class TestTargetAudienceDefault:
+    def test_target_audience_default(self):
+        config = ProjectConfig()
+        assert config.target_audience == "leadership"
+
+    def test_target_audience_engineering(self):
+        config = ProjectConfig(target_audience="engineering")
+        assert config.target_audience == "engineering"
+
+    def test_target_audience_mixed(self):
+        config = ProjectConfig(target_audience="mixed")
+        assert config.target_audience == "mixed"
+
+    def test_target_audience_roundtrip(self):
+        config = ProjectConfig(
+            project_name="roundtrip-test",
+            target_audience="engineering",
+        )
+        json_str = config.model_dump_json()
+        parsed = ProjectConfig.model_validate_json(json_str)
+        assert parsed.target_audience == "engineering"
+        assert parsed.project_name == "roundtrip-test"
+
+
+class TestWritingReviewMaxRounds:
+    def test_default(self):
+        config = ProjectConfig()
+        assert config.writing_review_max_rounds == 2
+
+    def test_custom(self):
+        config = ProjectConfig(writing_review_max_rounds=5)
+        assert config.writing_review_max_rounds == 5
+
+
+class TestStripTodoMarkers:
+    def test_strips_single_todo(self):
+        from ml_system_design_generator.pipeline import _strip_todo_markers
+        text = "Hello <!-- TODO: add details --> world"
+        assert _strip_todo_markers(text) == "Hello  world"
+
+    def test_strips_multiline_todo(self):
+        from ml_system_design_generator.pipeline import _strip_todo_markers
+        text = "Hello <!-- TODO:\nadd more\ndetails --> world"
+        assert _strip_todo_markers(text) == "Hello  world"
+
+    def test_noop_on_clean_text(self):
+        from ml_system_design_generator.pipeline import _strip_todo_markers
+        text = "This is clean markdown with no placeholders."
+        assert _strip_todo_markers(text) == text
+
+    def test_strips_multiple_todos(self):
+        from ml_system_design_generator.pipeline import _strip_todo_markers
+        text = "A <!-- TODO: x --> B <!-- TODO y --> C"
+        assert _strip_todo_markers(text) == "A  B  C"
+
+
+class TestFindTodos:
+    def test_finds_single_todo(self):
+        from ml_system_design_generator.pipeline import _find_todos
+        text = "Hello <!-- TODO: add details --> world"
+        assert len(_find_todos(text)) == 1
+
+    def test_finds_multiple_todos(self):
+        from ml_system_design_generator.pipeline import _find_todos
+        text = "A <!-- TODO: x --> B <!-- TODO y --> C"
+        assert len(_find_todos(text)) == 2
+
+    def test_no_todos(self):
+        from ml_system_design_generator.pipeline import _find_todos
+        text = "Clean text with no placeholders"
+        assert _find_todos(text) == []
+
+
+class TestCountWords:
+    def test_basic_count(self):
+        from ml_system_design_generator.pipeline import _count_words
+        assert _count_words("one two three four five") == 5
+
+    def test_excludes_code_blocks(self):
+        from ml_system_design_generator.pipeline import _count_words
+        text = "before ```python\ncode here\n``` after"
+        count = _count_words(text)
+        assert count == 2  # "before" and "after"
+
+    def test_excludes_html_comments(self):
+        from ml_system_design_generator.pipeline import _count_words
+        text = "visible <!-- hidden comment words --> text"
+        count = _count_words(text)
+        assert count == 2  # "visible" and "text"
+
+    def test_empty_string(self):
+        from ml_system_design_generator.pipeline import _count_words
+        assert _count_words("") == 0
+
+
+class TestSupplementaryModeDefaultAuto:
+    def test_pydantic_default(self):
+        config = ProjectConfig()
+        assert config.supplementary_mode == "auto"
+
+    def test_explicit_disabled_still_works(self):
+        config = ProjectConfig(supplementary_mode="disabled")
+        assert config.supplementary_mode == "disabled"
+
+
+class TestEscapeLatex:
+    def test_ampersand(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("A & B") == r"A \& B"
+
+    def test_percent(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("100%") == r"100\%"
+
+    def test_dollar(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("$10") == r"\$10"
+
+    def test_hash(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("item #1") == r"item \#1"
+
+    def test_underscore(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("my_var") == r"my\_var"
+
+    def test_braces(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("{x}") == r"\{x\}"
+
+    def test_multiple_specials(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("A & B $ C") == r"A \& B \$ C"
+
+    def test_no_specials(self):
+        from ml_system_design_generator.pipeline import _escape_latex
+        assert _escape_latex("plain text") == "plain text"

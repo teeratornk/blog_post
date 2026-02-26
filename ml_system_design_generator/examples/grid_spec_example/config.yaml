@@ -3,6 +3,7 @@ defaults:
   - _self_
 
 project_name: "ML-Powered Grid Operations Decision Support System"
+author: "Siemens Energy AI Lab"
 style: amazon_6page
 max_pages: 6
 docs_dir: ../../docs/grid_spec/
@@ -33,7 +34,7 @@ constraints:
   - "Latency < 500ms for real-time predictions"
   - "Must handle extreme weather events"
   - "NERC CIP compliance"
-target_audience: engineering
+target_audience: leadership
 
 azure:
   api_key: "${oc.env:AZURE_OPENAI_API_KEY}"
@@ -42,12 +43,16 @@ azure:
 
 models:
   default: gpt-5.2
-  writer: gpt-5.2
+  analyzer: gpt-5.2
+  writer: claude-opus-4-6
   reviewer: gpt-5.2
+  planner: claude-opus-4-6
+  advisor: claude-opus-4-6
 
 understanding_max_rounds: 2
 design_review_max_turns: 2
 design_revision_max_rounds: 2
+writing_review_max_rounds: 2
 compile_max_attempts: 3
 vector_db_enabled: true
 timeout: 120

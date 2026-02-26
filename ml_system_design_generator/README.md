@@ -4,12 +4,35 @@ A multi-agent CLI tool that reads markdown source documents and generates public
 
 ## How It Works
 
-The tool runs a 4-phase pipeline:
+The tool runs a 7-phase pipeline:
+
+```
+CONFIGURATION → UNDERSTANDING → OPPORTUNITY DISCOVERY → FEASIBILITY CHECK →
+PLAN (+ approval) → WRITING + REVIEW → PAGE BUDGET → SUPPLEMENTARY →
+USER REVIEW → FINALIZE
+```
 
 1. **Configuration** — Validates project config; optionally prompts interactively for missing fields (style, infrastructure, tech stack, constraints).
 2. **Document Understanding** — Reads source `.md` files, produces per-document summaries via a DocAnalyzer agent, identifies gaps with a GapAnalyzer, and cross-checks with an UnderstandingReviewer. Large doc sets are automatically embedded into a local ChromaDB vector store for retrieval during writing.
-3. **Design Generation** — A DesignPlanner agent adapts a style template into a concrete section plan. A DesignWriter writes each section as markdown, a DesignReviewer reviews it, and a ConsistencyChecker + InfraAdvisor perform cross-section review. Sections are converted to LaTeX via Pandoc, polished by a LaTeXAssembler agent, assembled into `main.tex`, and compiled with `latexmk` (with an automatic compile-fix loop).
-4. **User Review** — Presents the draft for approval. The user can approve, request revisions (with per-section comments), or abort.
+3. **Opportunity Discovery + Feasibility** — An OpportunityAnalyzer proposes ML solution directions from the understanding report. The user selects directions, then a FeasibilityAssessor evaluates risks (data, compute, timeline, etc.). Both steps support interactive revision loops.
+4. **Design Planning** — A DesignPlanner creates a section plan with page estimates. Word budgets are distributed proportionally across sections (`max_pages × 350 words/page`). The user approves or requests plan revisions (up to 3 rounds).
+5. **Writing + Review** — A DesignWriter drafts each section with a hard word limit. Sections are reviewed by a DesignReviewer and QualityReviewer, then cross-checked by a ConsistencyChecker and InfraAdvisor. Word budgets are re-enforced after every revision step. Sections are converted to LaTeX via Pandoc, polished by a LaTeXAssembler, and compiled with `latexmk` (with an automatic compile-fix loop).
+6. **Page Budget** — A PageBudgetManager compares the compiled PDF against the page budget. If over budget, it recommends condensation or splitting content into supplementary material (appendix or standalone document).
+7. **User Review** — Presents the draft for approval. The user can approve, request revisions (with per-section comments), or abort.
+
+### Word Budget Enforcement
+
+The pipeline enforces word limits at three checkpoints to prevent page overshoot:
+
+```
+Writer draft (aim 80% of target)
+  → ★ condense to 1.05× target
+    → Review → Revise (with word limit in prompt)
+      → ★ condense again
+        → Cross-review → Fix (with word limit in prompt)
+          → ★ condense again
+            → LaTeX conversion
+```
 
 ## Supported Styles
 
@@ -155,12 +178,16 @@ enabled_reviewers:
 | DocAnalyzer | 2 | Reads and summarizes each source document |
 | GapAnalyzer | 2 | Identifies missing information in source material |
 | UnderstandingReviewer | 2 | Cross-checks summaries and gap analysis |
-| DesignPlanner | 3 | Plans document structure from style template |
-| DesignWriter | 3 | Writes each section as markdown |
-| DesignReviewer | 3 | Reviews sections for quality and completeness |
-| ConsistencyChecker | 3 | Cross-section terminology and logic consistency |
-| InfraAdvisor | 3 | Validates infrastructure feasibility |
-| LaTeXAssembler | 3 | Polishes Pandoc-converted LaTeX within SAFE_ZONE markers |
+| OpportunityAnalyzer | 3 | Proposes ML solution directions from source docs |
+| FeasibilityAssessor | 3 | Evaluates risk and feasibility of selected directions |
+| DesignPlanner | 4 | Plans document structure from style template |
+| DesignWriter | 5 | Writes each section as markdown (with word budgets) |
+| DesignReviewer | 5 | Reviews sections for quality and completeness |
+| QualityReviewer | 5 | Checks writing quality, clarity, and technical depth |
+| ConsistencyChecker | 5 | Cross-section terminology and logic consistency |
+| InfraAdvisor | 5 | Validates infrastructure feasibility |
+| LaTeXAssembler | 5 | Polishes Pandoc-converted LaTeX within SAFE_ZONE markers |
+| PageBudgetManager | 6 | Recommends condensation or split when over budget |
 
 Reviewers can be individually toggled via `enabled_reviewers` in the config.
 
@@ -178,15 +205,19 @@ ml_system_design_generator/
 │   ├── prompts.py              # Rich interactive prompts
 │   ├── logging_config.py       # Rich console, PipelineCallbacks
 │   ├── conf/config.yaml        # Hydra defaults
-│   ├── agents/                 # 9 agent factories
+│   ├── agents/                 # 13 agent factories
 │   │   ├── doc_analyzer.py
 │   │   ├── gap_analyzer.py
 │   │   ├── understanding_reviewer.py
+│   │   ├── opportunity_analyzer.py
+│   │   ├── feasibility_assessor.py
 │   │   ├── design_planner.py
 │   │   ├── design_writer.py
 │   │   ├── design_reviewer.py
+│   │   ├── quality_reviewer.py
 │   │   ├── consistency_checker.py
 │   │   ├── infra_advisor.py
+│   │   ├── page_budget_manager.py
 │   │   └── latex_assembler.py
 │   └── tools/                  # Deterministic, testable utilities
 │       ├── doc_reader.py       # Read & chunk markdown files
@@ -212,7 +243,8 @@ ml_system_design_generator/
     ├── test_doc_reader.py
     ├── test_template_loader.py
     ├── test_vector_store.py
-    └── test_compiler.py
+    ├── test_compiler.py
+    └── test_latex_builder.py
 ```
 
 ## Tests
@@ -234,5 +266,7 @@ output/
 │   ├── approach.tex
 │   ├── risks.tex
 │   └── ...
+├── supplementary.tex     # (if split was decided)
+├── supplementary.pdf     # (if standalone mode)
 └── manifest.json         # Build provenance record
 ```

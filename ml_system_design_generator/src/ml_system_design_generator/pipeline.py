@@ -27,6 +27,7 @@ from .agents.infra_advisor import make_infra_advisor
 from .agents.latex_assembler import make_assembler
 from .agents.opportunity_analyzer import make_opportunity_analyzer
 from .agents.page_budget_manager import make_page_budget_manager
+from .agents.quality_reviewer import make_quality_reviewer
 from .agents.understanding_reviewer import make_understanding_reviewer
 from .config import build_role_llm_config
 from .logging_config import PipelineCallbacks, RichCallbacks, logger
@@ -109,6 +110,34 @@ def _extract_json(response: Any, model_cls: type) -> Any:
     except Exception as e:
         logger.warning("Failed to parse %s from response: %s", model_cls.__name__, e)
         return None
+
+
+_TODO_RE = re.compile(r"<!--\s*TODO:?\s*.*?-->", re.DOTALL)
+
+
+def _strip_todo_markers(text: str) -> str:
+    """Remove <!-- TODO: ... --> markers from text."""
+    return _TODO_RE.sub("", text)
+
+
+def _find_todos(text: str) -> list[str]:
+    """Return all TODO markers found in text."""
+    return _TODO_RE.findall(text)
+
+
+def _count_words(text: str) -> int:
+    """Count words in markdown text, excluding code blocks and HTML comments."""
+    cleaned = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<!--.*?-->", "", cleaned, flags=re.DOTALL)
+    return len(cleaned.split())
+
+
+def _escape_latex(text: str) -> str:
+    """Escape special LaTeX characters in plain text."""
+    for char, escaped in [("&", r"\&"), ("%", r"\%"), ("$", r"\$"),
+                          ("#", r"\#"), ("_", r"\_"), ("{", r"\{"), ("}", r"\}")]:
+        text = text.replace(char, escaped)
+    return text
 
 
 def _make_orchestrator() -> autogen.UserProxyAgent:
@@ -620,6 +649,18 @@ class Pipeline:
 
         Assumes ``run_plan()`` has already been called and ``self.design_plan``
         is populated.
+
+        The flow is::
+
+            Phase A — Initial Write (once):
+                For each section: draft → resolve TODOs → condense
+
+            Phase B — Outer Review Loop (up to writing_review_max_rounds):
+                Section review: review all sections, revise if ERROR/CRITICAL
+                Meta review: cross-review loop (up to _META_REVIEW_MAX)
+                Convergence: break early if nothing was revised
+
+            Phase C — Convert & Compile (once)
         """
         if not self.design_plan:
             raise RuntimeError("Must run plan phase first")
@@ -628,6 +669,7 @@ class Pipeline:
         orchestrator = _make_orchestrator()
         plan = self.design_plan
 
+        # ---- Phase A: Initial Write (once) --------------------------------
         writer = make_design_writer(self.config)
 
         for section in plan.sections:
@@ -638,9 +680,12 @@ class Pipeline:
             # Inject word limit if assigned
             word_limit_note = ""
             if section.target_word_count:
+                target = section.target_word_count
+                pages = section.estimated_pages
                 word_limit_note = (
-                    f"\nWORD LIMIT: ~{section.target_word_count} words "
-                    f"(~{section.estimated_pages:.1f} pages). Stay within this budget.\n"
+                    f"\nHARD WORD LIMIT: {target} words maximum (~{pages:.1f} pages). "
+                    f"Aim for {int(target * 0.8)} words on your first draft. "
+                    f"Going over this limit will trigger automatic condensation.\n"
                 )
 
             response = orchestrator.initiate_chat(
@@ -657,36 +702,81 @@ class Pipeline:
             )
 
             markdown = _extract_text(response)
+
+            # Resolve any TODO markers by asking the writer to address them
+            markdown = self._resolve_todos(section, markdown, orchestrator)
             self.section_markdown[section.section_id] = markdown
 
-            # Review section
-            review_feedback = self._review_section(section.section_id, markdown, orchestrator)
-
-            # If issues found, rewrite
-            if review_feedback and any(
-                r.severity in (Severity.ERROR, Severity.CRITICAL) for r in review_feedback
-            ):
-                feedback_text = "\n".join(f"[{r.Reviewer}]: {r.Review}" for r in review_feedback)
-                fix_writer = make_design_writer(self.config)
-                fix_response = orchestrator.initiate_chat(
-                    fix_writer,
-                    message=(
-                        f"Revise the '{section.title}' section based on reviewer feedback.\n\n"
-                        f"FEEDBACK:\n{feedback_text}\n\n"
-                        f"ORIGINAL SECTION:\n{markdown}"
-                    ),
-                    max_turns=1,
-                )
-                revised = _extract_text(fix_response)
-                if revised:
-                    self.section_markdown[section.section_id] = revised
+            # Word budget enforcement
+            if section.target_word_count:
+                markdown = self._condense_section(section, markdown, orchestrator)
+                self.section_markdown[section.section_id] = markdown
 
             self.callbacks.on_section_end(section.section_id)
 
-        # Cross-review
-        self._cross_review(orchestrator)
+        # ---- Phase B: Outer Review Loop -----------------------------------
+        _META_REVIEW_MAX = 2
 
-        # Convert markdown -> LaTeX and compile
+        for outer_round in range(1, self.config.writing_review_max_rounds + 1):
+            self.callbacks.on_review_round(outer_round, self.config.writing_review_max_rounds)
+            any_revised = False
+
+            # -- Section review: all sections every pass --
+            for section in plan.sections:
+                markdown = self.section_markdown[section.section_id]
+                review_feedback = self._review_section(
+                    section.section_id, markdown, orchestrator,
+                )
+
+                if review_feedback and any(
+                    r.severity in (Severity.ERROR, Severity.CRITICAL)
+                    for r in review_feedback
+                ):
+                    feedback_text = "\n".join(
+                        f"[{r.Reviewer}]: {r.Review}" for r in review_feedback
+                    )
+                    word_budget_note = ""
+                    if section.target_word_count:
+                        word_budget_note = (
+                            f"\nHARD WORD LIMIT: {section.target_word_count} words maximum. "
+                            f"Do NOT expand the section while fixing issues.\n"
+                        )
+                    fix_writer = make_design_writer(self.config)
+                    fix_response = orchestrator.initiate_chat(
+                        fix_writer,
+                        message=(
+                            f"Revise the '{section.title}' section based on reviewer feedback.\n\n"
+                            f"{word_budget_note}"
+                            f"FEEDBACK:\n{feedback_text}\n\n"
+                            f"ORIGINAL SECTION:\n{markdown}"
+                        ),
+                        max_turns=1,
+                    )
+                    revised = _extract_text(fix_response)
+                    if revised:
+                        revised = self._resolve_todos(section, revised, orchestrator)
+                        self.section_markdown[section.section_id] = revised
+                        any_revised = True
+
+                    # Re-enforce word budget after revision
+                    if section.target_word_count:
+                        md = self.section_markdown[section.section_id]
+                        md = self._condense_section(section, md, orchestrator)
+                        self.section_markdown[section.section_id] = md
+
+            # -- Meta review: loop until clean (up to _META_REVIEW_MAX) --
+            for _meta_round in range(_META_REVIEW_MAX):
+                meta_issues = self._cross_review(orchestrator)
+                if meta_issues:
+                    any_revised = True
+                if not meta_issues:
+                    break
+
+            # -- Convergence check --
+            if not any_revised:
+                break
+
+        # ---- Phase C: Convert & Compile (once) ----------------------------
         self._convert_and_compile(orchestrator)
 
         self.callbacks.on_phase_end("WRITING", True)
@@ -737,6 +827,105 @@ class Pipeline:
 
         return "\n\n".join(parts) if parts else "(No additional context available)"
 
+    def _resolve_todos(
+        self,
+        section: DesignSection,
+        markdown: str,
+        orchestrator: autogen.UserProxyAgent,
+    ) -> str:
+        """Resolve TODO markers by asking the writer to address each one.
+
+        Returns the updated markdown with TODOs replaced by real content.
+        If no TODOs exist, returns the original text unchanged.
+        Any TODOs that the agent fails to resolve are stripped as a fallback.
+        """
+        todos = _find_todos(markdown)
+        if not todos:
+            return markdown
+
+        self.callbacks.on_warning(
+            f"{section.section_id}: resolving {len(todos)} TODO marker(s)"
+        )
+
+        context = self._build_section_context(section)
+        todo_list = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(todos))
+
+        writer = make_design_writer(self.config)
+        response = orchestrator.initiate_chat(
+            writer,
+            message=(
+                f"The following section contains TODO placeholders that must be resolved.\n"
+                f"Address EVERY TODO below using the source context provided. Replace each\n"
+                f"TODO marker with concrete, grounded content. If a TODO truly cannot be\n"
+                f"addressed from the sources, replace it with a brief factual note.\n"
+                f"Do NOT leave any <!-- TODO --> markers in the output.\n\n"
+                f"TODOs to resolve:\n{todo_list}\n\n"
+                f"CONTEXT FROM SOURCES:\n{context}\n\n"
+                f"FULL SECTION (return the complete revised section):\n{markdown}"
+            ),
+            max_turns=1,
+        )
+
+        resolved = _extract_text(response)
+        if not resolved:
+            return _strip_todo_markers(markdown)
+
+        # Safety net: strip any remaining TODOs the agent missed
+        return _strip_todo_markers(resolved)
+
+    def _condense_section(
+        self,
+        section: DesignSection,
+        markdown: str,
+        orchestrator: autogen.UserProxyAgent,
+        max_attempts: int = 3,
+    ) -> str:
+        """Condense a section to fit its word budget. Returns (possibly condensed) markdown."""
+        if not section.target_word_count:
+            return markdown
+        word_count = _count_words(markdown)
+        threshold = int(section.target_word_count * 1.05)
+        for attempt in range(max_attempts):
+            if word_count <= threshold:
+                break
+            if attempt == 0:
+                condense_msg = (
+                    f"This section is {word_count} words but the STRICT budget is "
+                    f"{section.target_word_count} words. Condense it to ~{section.target_word_count} words.\n"
+                    f"Cut low-priority content, use tables/bullets, remove redundancy.\n"
+                    f"Return ONLY the condensed markdown.\n\n"
+                    f"SECTION:\n{markdown}"
+                )
+            else:
+                condense_msg = (
+                    f"You are at {word_count} words. The HARD LIMIT is "
+                    f"{section.target_word_count} words. Cut aggressively — "
+                    f"remove entire sub-sections if needed, merge tables, "
+                    f"eliminate examples. Return ONLY the condensed markdown.\n\n"
+                    f"SECTION:\n{markdown}"
+                )
+            self.callbacks.on_warning(
+                f"{section.section_id}: {word_count} words vs "
+                f"{section.target_word_count} target — condensing "
+                f"(attempt {attempt + 1})"
+            )
+            condense_writer = make_design_writer(self.config)
+            condense_response = orchestrator.initiate_chat(
+                condense_writer,
+                message=condense_msg,
+                max_turns=1,
+            )
+            condensed = _strip_todo_markers(_extract_text(condense_response))
+            new_count = _count_words(condensed) if condensed else word_count
+            if condensed and new_count < word_count:
+                markdown = condensed
+                word_count = new_count
+            else:
+                break  # no improvement, stop retrying
+
+        section.actual_word_count = _count_words(markdown)
+        return markdown
+
     def _review_section(
         self,
         section_id: str,
@@ -747,29 +936,50 @@ class Pipeline:
         collected: list[ReviewFeedback] = []
 
         reviewer = make_design_reviewer(self.config)
-        if reviewer is None:
-            return collected
+        if reviewer is not None:
+            self.callbacks.on_section_review(section_id, "DesignReviewer")
+            try:
+                response = orchestrator.initiate_chat(
+                    reviewer,
+                    message=(
+                        f"Review this design section (section_id: {section_id}):\n\n{markdown}"
+                    ),
+                    max_turns=1,
+                )
+                raw = _extract_text(response)
+                feedback, _err = validate_review(raw)
+                if feedback:
+                    collected.append(feedback)
+            except Exception as e:
+                self.callbacks.on_warning(f"DesignReviewer skipped for {section_id}: {e}")
 
-        self.callbacks.on_section_review(section_id, "DesignReviewer")
-        try:
-            response = orchestrator.initiate_chat(
-                reviewer,
-                message=(
-                    f"Review this design section (section_id: {section_id}):\n\n{markdown}"
-                ),
-                max_turns=1,
-            )
-            raw = _extract_text(response)
-            feedback, _err = validate_review(raw)
-            if feedback:
-                collected.append(feedback)
-        except Exception as e:
-            self.callbacks.on_warning(f"DesignReviewer skipped for {section_id}: {e}")
+        quality_reviewer = make_quality_reviewer(self.config)
+        if quality_reviewer is not None:
+            self.callbacks.on_section_review(section_id, "QualityReviewer")
+            try:
+                response = orchestrator.initiate_chat(
+                    quality_reviewer,
+                    message=(
+                        f"Quality-check this design section (section_id: {section_id}):\n\n{markdown}"
+                    ),
+                    max_turns=1,
+                )
+                raw = _extract_text(response)
+                feedback, _err = validate_review(raw)
+                if feedback:
+                    collected.append(feedback)
+            except Exception as e:
+                self.callbacks.on_warning(f"QualityReviewer skipped for {section_id}: {e}")
 
         return collected
 
-    def _cross_review(self, orchestrator: autogen.UserProxyAgent) -> None:
-        """Run ConsistencyChecker and InfraAdvisor across all sections."""
+    def _cross_review(self, orchestrator: autogen.UserProxyAgent) -> bool:
+        """Run ConsistencyChecker and InfraAdvisor across all sections.
+
+        Returns ``True`` if any issues were found and fixes applied.
+        """
+        issues_found = False
+
         # Build section summaries
         summaries = "\n\n".join(
             f"=== {sid} ===\n{md[:300]}..."
@@ -791,6 +1001,7 @@ class Pipeline:
                 if feedback and "no issues" not in (feedback.Review or "").lower():
                     self.callbacks.on_warning(f"ConsistencyChecker: {feedback.Review[:150]}")
                     self._apply_cross_review_fixes(feedback, orchestrator)
+                    issues_found = True
             except Exception as e:
                 self.callbacks.on_warning(f"ConsistencyChecker skipped: {e}")
 
@@ -817,8 +1028,11 @@ class Pipeline:
                 if feedback and "no issues" not in (feedback.Review or "").lower():
                     self.callbacks.on_warning(f"InfraAdvisor: {feedback.Review[:150]}")
                     self._apply_cross_review_fixes(feedback, orchestrator)
+                    issues_found = True
             except Exception as e:
                 self.callbacks.on_warning(f"InfraAdvisor skipped: {e}")
+
+        return issues_found
 
     def _apply_cross_review_fixes(
         self,
@@ -833,25 +1047,46 @@ class Pipeline:
                 if sid in feedback.Review:
                     affected.append(sid)
 
+        # Look up section word budgets
+        section_by_id: dict[str, DesignSection] = {}
+        if self.design_plan:
+            section_by_id = {s.section_id: s for s in self.design_plan.sections}
+
         for sid in affected:
             if sid not in self.section_markdown:
                 continue
             try:
+                word_budget_note = ""
+                sec = section_by_id.get(sid)
+                if sec and sec.target_word_count:
+                    word_budget_note = (
+                        f"\nHARD WORD LIMIT: {sec.target_word_count} words maximum. "
+                        f"Do NOT expand the section while fixing issues.\n"
+                    )
                 fix_writer = make_design_writer(self.config)
                 response = orchestrator.initiate_chat(
                     fix_writer,
                     message=(
                         f"Revise this section based on cross-review feedback.\n\n"
+                        f"{word_budget_note}"
                         f"FEEDBACK: {feedback.Review}\n\n"
                         f"SECTION ({sid}):\n{self.section_markdown[sid]}"
                     ),
                     max_turns=1,
                 )
-                revised = _extract_text(response)
+                revised = _strip_todo_markers(_extract_text(response))
                 if revised:
                     self.section_markdown[sid] = revised
             except Exception as e:
                 self.callbacks.on_warning(f"Cross-review fix skipped for {sid}: {e}")
+
+        # Re-enforce word budget after cross-review fixes
+        for sid in affected:
+            sec = section_by_id.get(sid)
+            if sec and sec.target_word_count and sid in self.section_markdown:
+                self.section_markdown[sid] = self._condense_section(
+                    sec, self.section_markdown[sid], orchestrator
+                )
 
     def _convert_and_compile(self, orchestrator: autogen.UserProxyAgent) -> None:
         """Convert markdown sections to LaTeX and compile."""
@@ -889,7 +1124,7 @@ class Pipeline:
 
         # Assemble main.tex
         section_ids = list(self.section_latex.keys())
-        preamble = generate_preamble(title=self.config.project_name)
+        preamble = generate_preamble(title=self.config.project_name, author=self.config.author)
         main_tex = assemble_main_tex(preamble, section_ids, title=self.config.project_name)
         write_main_tex(main_tex, self.output_dir)
         write_section_files(self.section_latex, self.output_dir)
@@ -988,9 +1223,18 @@ class Pipeline:
         sections_info = ""
         if self.design_plan:
             for s in self.design_plan.sections:
+                actual_words = _count_words(self.section_markdown.get(s.section_id, ""))
+                actual_pages_est = actual_words / self.config.words_per_page
+                budget_words = s.target_word_count or 0
+                over_flag = ""
+                if budget_words and actual_words > budget_words:
+                    pct = int((actual_words - budget_words) / budget_words * 100)
+                    over_flag = f" [OVER BUDGET by {pct}%]"
                 sections_info += (
                     f"- {s.section_id}: {s.title} "
-                    f"(est. {s.estimated_pages:.1f} pages, priority={s.priority})\n"
+                    f"(actual ~{actual_words}w / ~{actual_pages_est:.1f}p, "
+                    f"budget ~{budget_words}w / {s.estimated_pages:.1f}p, "
+                    f"priority={s.priority}){over_flag}\n"
                 )
 
         response = orchestrator.initiate_chat(
@@ -1017,6 +1261,51 @@ class Pipeline:
         self.callbacks.on_phase_end("PAGE_BUDGET", True)
         return decision
 
+    def _condense_main_sections(self) -> None:
+        """Condense main-body sections to their budgets after split decision."""
+        if not self.split_decision or not self.split_decision.supplementary_plan:
+            return
+        plan = self.split_decision.supplementary_plan
+        main_ids = set(plan.main_sections)
+        if not self.design_plan:
+            return
+
+        orchestrator = _make_orchestrator()
+        condensed_any = False
+        for section in self.design_plan.sections:
+            if section.section_id not in main_ids:
+                continue
+            if not section.target_word_count:
+                continue
+            md = self.section_markdown.get(section.section_id, "")
+            word_count = _count_words(md)
+            if word_count <= section.target_word_count:
+                continue
+            self.callbacks.on_warning(
+                f"Post-split condense {section.section_id}: "
+                f"{word_count} → {section.target_word_count} words"
+            )
+            writer = make_design_writer(self.config)
+            response = orchestrator.initiate_chat(
+                writer,
+                message=(
+                    f"You are at {word_count} words. The HARD LIMIT is "
+                    f"{section.target_word_count} words. Cut aggressively — "
+                    f"remove entire sub-sections if needed, merge tables, "
+                    f"eliminate examples. Return ONLY the condensed markdown.\n\n"
+                    f"SECTION:\n{md}"
+                ),
+                max_turns=1,
+            )
+            condensed = _strip_todo_markers(_extract_text(response))
+            if condensed and _count_words(condensed) < word_count:
+                self.section_markdown[section.section_id] = condensed
+                condensed_any = True
+
+        if condensed_any:
+            # Re-convert condensed markdown to LaTeX
+            self._convert_and_compile(orchestrator)
+
     def run_supplementary(self) -> CompilationResult | None:
         """Move overflow sections to appendix/standalone and recompile."""
         if not self.split_decision or self.split_decision.action != "split":
@@ -1027,7 +1316,7 @@ class Pipeline:
 
         self.callbacks.on_phase_start("SUPPLEMENTARY", "Building supplementary materials")
 
-        preamble = generate_preamble(title=self.config.project_name)
+        preamble = generate_preamble(title=self.config.project_name, author=self.config.author)
 
         if plan.mode == "appendix":
             # Rebuild main.tex with appendix sections
@@ -1058,7 +1347,8 @@ class Pipeline:
         if main_section_ids:
             last_main = main_section_ids[-1]
             if last_main in self.section_latex:
-                note = f"\n\n\\paragraph{{Supplementary Materials.}} {plan.cross_reference_note}\n"
+                safe_note = _escape_latex(plan.cross_reference_note)
+                note = f"\n\n\\paragraph{{Supplementary Materials.}} {safe_note}\n"
                 self.section_latex[last_main] += note
                 write_section_files(
                     {last_main: self.section_latex[last_main]}, self.output_dir,
@@ -1108,7 +1398,7 @@ class Pipeline:
                         ),
                         max_turns=1,
                     )
-                    revised = _extract_text(response)
+                    revised = _strip_todo_markers(_extract_text(response))
                     if revised:
                         self.section_markdown[sid] = revised
                 except Exception as e:
@@ -1128,7 +1418,7 @@ class Pipeline:
                         ),
                         max_turns=1,
                     )
-                    revised = _extract_text(response)
+                    revised = _strip_todo_markers(_extract_text(response))
                     if revised:
                         self.section_markdown[sid] = revised
                 except Exception as e:
@@ -1168,6 +1458,22 @@ class Pipeline:
                 if supp_pdf_path.exists():
                     supp_pdf = str(supp_pdf_path)
 
+        page_count = self.compilation_result.page_count if self.compilation_result else None
+
+        # Estimate main body pages
+        main_page_count: int | None = page_count  # default: total
+        if supp_sections and self.design_plan and page_count:
+            supp_est = sum(
+                s.estimated_pages for s in self.design_plan.sections
+                if s.section_id in set(supp_sections)
+            )
+            total_est = self.design_plan.total_estimated_pages or sum(
+                s.estimated_pages for s in self.design_plan.sections
+            )
+            if total_est > 0:
+                supp_pages = int(round(supp_est / total_est * page_count))
+                main_page_count = page_count - supp_pages
+
         self.manifest = BuildManifest(
             project_name=self.config.project_name,
             output_dir=str(self.output_dir),
@@ -1176,7 +1482,8 @@ class Pipeline:
             source_files=[str(f) for f in list_doc_files(self.docs_dir)],
             style_used=self.config.style,
             compilation_attempts=self.config.compile_max_attempts,
-            page_count=self.compilation_result.page_count if self.compilation_result else None,
+            page_count=page_count,
+            main_page_count=main_page_count,
             warnings=warnings,
             supplementary_tex=supp_tex,
             supplementary_pdf=supp_pdf,
@@ -1293,6 +1600,9 @@ class Pipeline:
             # Phase 4: Page budget check
             self.run_page_budget()
             phases.append(PipelinePhase.PAGE_BUDGET)
+
+            # Condense main-body sections after split decision
+            self._condense_main_sections()
 
             # Phase 5: Supplementary material (if split was decided)
             self.run_supplementary()

@@ -248,14 +248,10 @@ class RichCallbacks:
         console.print(table)
         if report.summary:
             console.print(f"\n  [dim]{report.summary}[/]")
-        console.print(
-            "\n  Enter a number to preview full description, or choose an action:"
-        )
-
         while True:
             choice = (
                 console.input(
-                    "[bold]\\[s]elect (comma-sep #s) / \\[c]ustom / \\[q]uit:[/] "
+                    "[bold]\\[#]preview / \\[s]elect (comma-sep #s) / \\[c]ustom / \\[q]uit:[/] "
                 )
                 .strip()
                 .lower()
@@ -269,8 +265,19 @@ class RichCallbacks:
                     console.print(f"\n  [cyan]{opp.title}[/] ({opp.opportunity_id})")
                     console.print(f"  {opp.description}")
                     console.print(
-                        f"  Evidence: {', '.join(opp.source_evidence) or '—'}\n"
+                        f"  Evidence: {', '.join(opp.source_evidence) or '—'}"
                     )
+                    confirm = (
+                        console.input("  [bold]Select this opportunity? \\[y/n]:[/] ")
+                        .strip()
+                        .lower()
+                    )
+                    if confirm in ("y", "yes"):
+                        return OpportunitySelection(
+                            action=OpportunitySelectionAction.SELECT,
+                            selected_ids=[opp.opportunity_id],
+                        )
+                    console.print()
                 else:
                     console.print("[yellow]Invalid number.[/]")
                 continue
