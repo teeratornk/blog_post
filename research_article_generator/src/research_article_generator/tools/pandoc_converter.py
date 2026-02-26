@@ -54,6 +54,7 @@ def _annotate_safe_zones(latex: str) -> str:
         "equation", "equation*", "align", "align*", "gather", "gather*",
         "multline", "multline*", "eqnarray", "eqnarray*", "math",
         "displaymath", "tabular", "tabular*",
+        "tikzpicture",
     }
 
     for line in lines:

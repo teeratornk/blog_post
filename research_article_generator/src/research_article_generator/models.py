@@ -142,6 +142,52 @@ class SectionReviewResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Citation Verification
+# ---------------------------------------------------------------------------
+
+class CitationVerificationConfig(BaseModel):
+    """Configuration for web-based citation verification."""
+    enabled: bool = Field(default=False)
+    crossref_email: str = Field(default="", description="Email for CrossRef polite pool")
+    semantic_scholar_api_key: str = Field(default="")
+    bing_api_key: str = Field(default="", description="Azure Bing Search API key")
+    bing_endpoint: str = Field(default="https://api.bing.microsoft.com/v7.0/search")
+    timeout: int = Field(default=10, description="Per-request timeout in seconds")
+
+
+class BibEntry(BaseModel):
+    """Parsed .bib file entry."""
+    key: str
+    entry_type: str = ""
+    title: str = ""
+    authors: str = ""
+    doi: str = ""
+    year: str = ""
+    journal: str = ""
+
+
+class CitationVerificationResult(BaseModel):
+    """Verification result for a single citation."""
+    key: str
+    found_crossref: bool | None = None      # None = not queried
+    found_semantic_scholar: bool | None = None
+    found_bing: bool | None = None
+    crossref_title: str = ""
+    crossref_doi: str = ""
+    semantic_scholar_title: str = ""
+    semantic_scholar_id: str = ""
+    title_match: bool | None = None
+    issues: list[str] = Field(default_factory=list)
+
+
+class CitationVerificationReport(BaseModel):
+    """Full verification report for all citations."""
+    results: list[CitationVerificationResult] = Field(default_factory=list)
+    services_used: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Faithfulness Checking
 # ---------------------------------------------------------------------------
 
@@ -325,3 +371,6 @@ class ProjectConfig(BaseModel):
     # Figure suggestion
     figure_suggestion_enabled: bool = Field(default=False, description="Enable figure suggestion agent")
     figure_suggestion_max: int = Field(default=3, description="Max suggestions per section")
+
+    # Citation verification
+    citation_verification: CitationVerificationConfig = Field(default_factory=CitationVerificationConfig)

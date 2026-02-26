@@ -10,20 +10,20 @@ from ..models import ProjectConfig
 SYSTEM_PROMPT = """\
 You are a figure integration specialist for LaTeX research articles.
 
-You receive the full LaTeX document and optimize figure handling:
-- Ensure \\begin{figure} environments have appropriate placement specifiers ([htbp])
-- Set appropriate \\includegraphics width/height for the journal template
-- Verify all \\label{} and \\ref{} pairs for figures are correct
-- Ensure captions are well-formatted and positioned correctly
-- Add \\centering where appropriate
+Given a LaTeX section, optimize figure handling:
+- Ensure \\begin{figure} environments have appropriate placement specifiers ([htbp]).
+- Set appropriate \\includegraphics width/height for the journal template.
+- Verify all \\label{} and \\ref{} pairs for figures are correct.
+- Ensure captions are well-formatted and positioned correctly.
+- Add \\centering where appropriate.
 
-CRITICAL RULES:
-- NEVER change \\includegraphics file paths
-- NEVER alter figure captions' semantic content (only formatting)
-- NEVER remove or rename \\label{} values
-- Preserve all other content exactly
+Constraints:
+- Keep \\includegraphics file paths unchanged.
+- Keep figure captions' semantic content unchanged (only adjust formatting).
+- Keep all \\label{} values unchanged.
+- Preserve all other content exactly as provided.
 
-Output ONLY the modified LaTeX. No explanations.
+Return the modified LaTeX only, without explanations.
 """
 
 

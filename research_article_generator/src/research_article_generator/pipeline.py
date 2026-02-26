@@ -436,6 +436,20 @@ class Pipeline:
                     ))
                     next_priority += 1
 
+        # Add standard sections mentioned in review notes but missing from plan
+        added_ids = self._add_sections_from_review_notes(plan, review_notes)
+        if added_ids:
+            self.callbacks.on_warning(
+                f"Added {len(added_ids)} section(s) from review notes: {', '.join(added_ids)}"
+            )
+
+        # Generate placeholder drafts for sections without source files
+        created = self._generate_placeholder_drafts(plan, draft_files)
+        if created:
+            self.callbacks.on_warning(
+                f"Generated {len(created)} placeholder draft(s): {', '.join(p.name for p in created)}"
+            )
+
         plan.plan_review_notes = review_notes
         self.structure_plan = plan
 
@@ -1771,6 +1785,214 @@ class Pipeline:
                 _add(part)
 
         return affected
+
+    # -----------------------------------------------------------------------
+    # Placeholder draft generation for missing sections
+    # -----------------------------------------------------------------------
+
+    # Standard sections that PlanReviewer commonly recommends.
+    # Maps keyword → (section_id, title, position).
+    # position: "start" inserts before all sections, "end" appends after all.
+    _REVIEW_SECTION_KEYWORDS: dict[str, tuple[str, str, str]] = {
+        "abstract": ("abstract", "Abstract", "start"),
+        "conclusion": ("conclusion", "Conclusion", "end"),
+        "discussion": ("discussion", "Discussion", "end"),
+        "results": ("results", "Results", "end"),
+        "acknowledgement": ("acknowledgements", "Acknowledgements", "end"),
+        "acknowledgment": ("acknowledgements", "Acknowledgements", "end"),
+    }
+
+    def _add_sections_from_review_notes(
+        self,
+        plan: StructurePlan,
+        review_notes: str | None,
+    ) -> list[str]:
+        """Add standard sections mentioned in review notes but missing from the plan.
+
+        Sections are inserted at natural positions (e.g. Abstract at the start,
+        Conclusion at the end) rather than blindly appended.
+
+        Returns list of section_ids that were added.
+        """
+        if not review_notes:
+            return []
+
+        notes_lower = review_notes.lower()
+        existing_titles_lower = {s.title.lower() for s in plan.sections}
+        existing_ids = {s.section_id for s in plan.sections}
+        added: list[str] = []
+
+        # Collect sections to insert, grouped by position
+        to_prepend: list[SectionPlan] = []
+        to_append: list[SectionPlan] = []
+
+        for keyword, (section_id, title, position) in self._REVIEW_SECTION_KEYWORDS.items():
+            if section_id in existing_ids or section_id in added:
+                continue
+            if keyword not in notes_lower:
+                continue
+            # Check if a section with this type already exists by title keyword
+            if any(keyword in t for t in existing_titles_lower):
+                continue
+
+            new_section = SectionPlan(
+                section_id=section_id,
+                title=title,
+                source_file=f"drafts/{section_id}.md",
+                priority=0,  # re-numbered below
+            )
+            if position == "start":
+                to_prepend.append(new_section)
+            else:
+                to_append.append(new_section)
+            added.append(section_id)
+
+        if not added:
+            return []
+
+        # Rebuild sections list with correct ordering
+        plan.sections = to_prepend + plan.sections + to_append
+
+        # Re-number priorities to match new list order
+        for i, section in enumerate(plan.sections):
+            section.priority = i + 1
+
+        return added
+
+    @staticmethod
+    def _placeholder_content(title: str, section_id: str) -> str:
+        """Return section-type-aware deterministic placeholder markdown."""
+        key = section_id.lower() + " " + title.lower()
+
+        if "abstract" in key:
+            guidance = "Summarize the research problem, methodology, key results, and conclusions."
+        elif "conclusion" in key:
+            guidance = "Summarize the key findings from previous sections. Discuss implications and future work."
+        elif "discussion" in key:
+            guidance = "Interpret the results. Compare with existing literature. Discuss limitations."
+        elif "result" in key:
+            guidance = "Present the main findings. Reference figures and tables."
+        elif "acknowledgement" in key or "acknowledgment" in key:
+            guidance = "Acknowledge funding sources, collaborators, and institutional support."
+        else:
+            guidance = f"Write the {title} section content."
+
+        return (
+            f"# {title}\n"
+            f"\n"
+            f"<!-- TODO: {guidance} -->\n"
+            f"<!-- This section was added by PlanReviewer but no draft file exists. -->\n"
+        )
+
+    def _generate_placeholder_drafts(
+        self,
+        plan: StructurePlan,
+        draft_files: list[Path],
+    ) -> list[Path]:
+        """Generate placeholder .md files for plan sections without source files.
+
+        Uses a single LLM call to derive placeholder content from existing drafts.
+        Falls back to deterministic templates on any failure.
+
+        Returns a list of created file paths.
+        """
+        existing_stems = {f.stem for f in draft_files}
+        missing_sections: list[SectionPlan] = []
+
+        for section in plan.sections:
+            source_path = self.config_dir / section.source_file
+            # Also check draft_dir fallback (same as run_conversion)
+            alt_path = self.draft_dir / Path(section.source_file).name
+            if not source_path.exists() and not alt_path.exists():
+                stem = Path(section.source_file).stem
+                if stem not in existing_stems:
+                    missing_sections.append(section)
+
+        # Detect duplicate source file assignments: when the auto-revision
+        # maps multiple sections to the same existing file, the duplicates
+        # need their own placeholder files.
+        source_usage: dict[str, list[SectionPlan]] = {}
+        for section in plan.sections:
+            key = Path(section.source_file).name
+            source_usage.setdefault(key, []).append(section)
+        for filename, sections in source_usage.items():
+            if len(sections) > 1:
+                for dup in sections[1:]:
+                    if dup not in missing_sections:
+                        dup.source_file = f"drafts/{dup.section_id}.md"
+                        missing_sections.append(dup)
+
+        if not missing_sections:
+            return []
+
+        self.draft_dir.mkdir(parents=True, exist_ok=True)
+        created: list[Path] = []
+
+        # Try a single LLM call for all missing sections
+        llm_content: dict[str, str] = {}
+        try:
+            planner = make_structure_planner(self.config, template_context=self.template_context)
+            orchestrator = autogen.UserProxyAgent(
+                name="Orchestrator",
+                human_input_mode="NEVER",
+                code_execution_config=False,
+            )
+
+            # Build summaries of existing drafts (first 30 lines each)
+            draft_summaries = ""
+            for sid, content in self.source_md.items():
+                preview = "\n".join(content.splitlines()[:30])
+                draft_summaries += f"\n--- {sid} ---\n{preview}\n...\n"
+
+            missing_desc = "\n".join(
+                f"- {s.section_id}: {s.title}" for s in missing_sections
+            )
+
+            response = orchestrator.initiate_chat(
+                planner,
+                message=(
+                    "The following sections were added to the structure plan but have no "
+                    "draft files. For each missing section, generate a brief markdown draft "
+                    "skeleton. Derive what you can from the existing drafts. Use "
+                    "`<!-- TODO: ... -->` comments for content the user must write.\n\n"
+                    "Return a JSON object mapping section_id to markdown content.\n"
+                    "Example: {\"conclusion\": \"# Conclusion\\n\\n<!-- TODO: ... -->\"}\n\n"
+                    f"Missing sections:\n{missing_desc}\n\n"
+                    f"Existing draft summaries:\n{draft_summaries}"
+                ),
+                max_turns=1,
+            )
+
+            raw = _extract_latex(response)
+            if "{" in raw:
+                json_str = raw[raw.find("{"):raw.rfind("}") + 1]
+                llm_content = json.loads(json_str)
+                if not isinstance(llm_content, dict):
+                    llm_content = {}
+        except Exception as e:
+            logger.warning("LLM placeholder generation failed, using deterministic fallback: %s", e)
+            llm_content = {}
+
+        # Write placeholder files
+        for section in missing_sections:
+            content = llm_content.get(section.section_id)
+            if not content or not isinstance(content, str):
+                content = self._placeholder_content(section.title, section.section_id)
+
+            # Ensure TODO marker exists
+            if "TODO" not in content:
+                content += f"\n\n<!-- TODO: Review and complete this section. -->\n"
+
+            out_path = self.draft_dir / f"{section.section_id}.md"
+            if not out_path.exists():
+                out_path.write_text(content, encoding="utf-8")
+                # Update source_file in the plan to point to the new file
+                section.source_file = str(out_path.relative_to(self.config_dir))
+                # Also add to source_md so faithfulness checks can reference it
+                self.source_md[section.section_id] = content
+                created.append(out_path)
+
+        return created
 
     def _identify_affected_sections(self, result: CompilationResult) -> list[str]:
         """Map compilation errors to section files by matching error context/message."""

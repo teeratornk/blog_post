@@ -29,6 +29,16 @@ class ModelConf:
 
 
 @dataclass
+class CitationVerificationConf:
+    enabled: bool = False
+    crossref_email: str = "${oc.env:CROSSREF_EMAIL,''}"
+    semantic_scholar_api_key: str = "${oc.env:SEMANTIC_SCHOLAR_API_KEY,''}"
+    bing_api_key: str = "${oc.env:BING_SEARCH_API_KEY,''}"
+    bing_endpoint: str = "https://api.bing.microsoft.com/v7.0/search"
+    timeout: int = 10
+
+
+@dataclass
 class RagConf:
     # --- Dispatch + CLI-only fields ---
     mode: str = "run"

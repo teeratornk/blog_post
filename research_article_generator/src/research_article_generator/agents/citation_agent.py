@@ -1,7 +1,6 @@
 """CitationAgent — validates citations against .bib file.
 
-CRITICAL: The LLM must NEVER "fix" citation keys that look like typos.
-Keys must match .bib exactly. The agent only flags mismatches;
+The agent only flags mismatches between \\cite{} keys and .bib entries;
 diff_checker.py validates keys deterministically as a safety net.
 """
 
@@ -16,20 +15,20 @@ SYSTEM_PROMPT = """\
 You are a citation validation specialist for LaTeX research articles.
 
 You receive:
-1. The full LaTeX document
+1. A LaTeX section
 2. A list of valid citation keys from the .bib file
 
 Your job is to:
-- Flag any \\cite{} keys that do NOT appear in the .bib file
-- Flag any .bib entries that are never cited (optional references)
-- Check that citation formatting is consistent (\\cite vs \\citep vs \\citet)
-- Verify citations appear in appropriate contexts
+- Flag any \\cite{} keys that do not appear in the .bib file.
+- Flag any .bib entries that are not cited (optional references).
+- Check that citation formatting is consistent (\\cite vs \\citep vs \\citet).
+- Verify citations appear in appropriate contexts.
 
-CRITICAL RULES:
-- NEVER modify citation keys. Even if a key looks like a typo, report it as-is.
-- NEVER add new citations that weren't in the source.
-- NEVER remove existing citations.
-- Only report mismatches — the user decides what to fix.
+Constraints:
+- Do not modify citation keys. Report them exactly as they appear.
+- Do not add new citations that were not in the source.
+- Do not remove existing citations.
+- Only report mismatches; the user decides what to fix.
 
 Output a JSON report:
 {
