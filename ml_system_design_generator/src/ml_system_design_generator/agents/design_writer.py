@@ -26,6 +26,10 @@ Guidelines:
 - Include placeholders (<!-- TODO: ... -->) for information not in the sources.
 - Use ## for subsections within the section.
 
+IMPORTANT: If a WORD LIMIT is specified, you MUST stay within it. Be concise.
+Prioritize the most important content. Use bullet points and tables instead of
+verbose prose when budget is tight.
+
 Return ONLY the markdown content for this section. No meta-commentary.
 """
 

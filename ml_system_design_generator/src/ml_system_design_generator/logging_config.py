@@ -11,7 +11,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 if TYPE_CHECKING:
-    from .models import DesignPlan, UserFeedback
+    from .models import DesignPlan, PlanReviewResult, UserFeedback
 
 console = Console()
 
@@ -50,6 +50,7 @@ class PipelineCallbacks(Protocol):
     def on_section_review(self, section_id: str, reviewer: str) -> None: ...
     def on_compile_attempt(self, attempt: int, max_attempts: int) -> None: ...
     def on_review_round(self, round_num: int, max_rounds: int) -> None: ...
+    def on_plan_approval(self, plan: DesignPlan) -> PlanReviewResult: ...
     def on_plan_review(self, plan: DesignPlan) -> UserFeedback: ...
     def on_warning(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
@@ -83,6 +84,61 @@ class RichCallbacks:
 
     def on_review_round(self, round_num: int, max_rounds: int) -> None:
         console.print(f"  [cyan]Review round {round_num}/{max_rounds}[/]")
+
+    def on_plan_approval(self, plan: DesignPlan) -> PlanReviewResult:
+        from .models import PlanAction, PlanReviewResult
+
+        if not self.interactive:
+            return PlanReviewResult(action=PlanAction.APPROVE)
+
+        # Display plan as a Rich table with word limits and priority
+        table = Table(title="Design Plan (Pre-Writing Approval)", show_lines=True)
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Section ID", style="cyan")
+        table.add_column("Title")
+        table.add_column("Est. Pages", justify="right")
+        table.add_column("Word Limit", justify="right")
+        table.add_column("Priority", justify="right")
+
+        for i, section in enumerate(plan.sections, 1):
+            word_limit = str(section.target_word_count) if section.target_word_count else "—"
+            table.add_row(
+                str(i),
+                section.section_id,
+                section.title,
+                f"{section.estimated_pages:.1f}",
+                word_limit,
+                str(section.priority),
+            )
+
+        console.print()
+        console.print(table)
+        console.print(
+            f"\n  Total estimated pages: [bold]{plan.total_estimated_pages:.1f}[/]"
+        )
+        if plan.page_budget:
+            console.print(f"  Page budget: {plan.page_budget}")
+
+        console.print()
+
+        while True:
+            choice = console.input("[bold]\\[a]pprove / \\[r]evise / \\[q]uit:[/] ").strip().lower()
+            if choice in ("a", "approve"):
+                return PlanReviewResult(action=PlanAction.APPROVE)
+            elif choice in ("q", "quit"):
+                return PlanReviewResult(action=PlanAction.ABORT)
+            elif choice in ("r", "revise"):
+                console.print("Enter revision feedback (empty line to finish):")
+                lines: list[str] = []
+                while True:
+                    line = console.input("")
+                    if not line:
+                        break
+                    lines.append(line)
+                feedback = "\n".join(lines)
+                return PlanReviewResult(action=PlanAction.REVISE, feedback=feedback)
+            else:
+                console.print("[yellow]Please enter 'a', 'r', or 'q'.[/]")
 
     def on_plan_review(self, plan: DesignPlan) -> UserFeedback:
         from .models import UserFeedback

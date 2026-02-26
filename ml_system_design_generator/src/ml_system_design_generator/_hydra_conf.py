@@ -75,6 +75,12 @@ class MlsdConf:
     timeout: int = 120
     seed: int = 42
 
+    # Page budget & supplementary
+    supplementary_mode: str = "disabled"
+    supplementary_threshold: float = 1.3
+    max_plan_revisions: int = 3
+    words_per_page: int = 500
+
     enabled_reviewers: dict[str, bool] = field(default_factory=lambda: {
         "DesignReviewer": True,
         "ConsistencyChecker": True,

@@ -51,8 +51,19 @@ def assemble_main_tex(
     section_ids: list[str],
     *,
     title: str = "",
+    appendix_ids: list[str] | None = None,
 ) -> str:
-    """Assemble the main.tex skeleton with preamble and \\input{} calls."""
+    """Assemble the main.tex skeleton with preamble and \\input{} calls.
+
+    Parameters
+    ----------
+    appendix_ids : list[str] | None
+        Section IDs to include after ``\\appendix``.  These are excluded
+        from the main body even if they also appear in *section_ids*.
+    """
+    appendix_set = set(appendix_ids or [])
+    main_ids = [s for s in section_ids if s not in appendix_set]
+
     parts: list[str] = [preamble]
 
     parts.append("")
@@ -63,6 +74,39 @@ def assemble_main_tex(
         parts.append("\\maketitle")
         parts.append("")
 
+    for section_id in main_ids:
+        parts.append(f"\\input{{sections/{section_id}}}")
+
+    if appendix_ids:
+        parts.append("")
+        parts.append("\\appendix")
+        for section_id in appendix_ids:
+            parts.append(f"\\input{{sections/{section_id}}}")
+
+    parts.append("")
+    parts.append("\\end{document}")
+    parts.append("")
+
+    return "\n".join(parts)
+
+
+def assemble_supplementary_tex(
+    preamble: str,
+    section_ids: list[str],
+    project_name: str = "",
+) -> str:
+    """Assemble a standalone supplementary materials document."""
+    parts: list[str] = [preamble]
+
+    parts.append("")
+    parts.append("\\begin{document}")
+    parts.append("")
+
+    supp_title = f"Supplementary Materials: {project_name}" if project_name else "Supplementary Materials"
+    parts.append(f"\\title{{{supp_title}}}")
+    parts.append("\\maketitle")
+    parts.append("")
+
     for section_id in section_ids:
         parts.append(f"\\input{{sections/{section_id}}}")
 
@@ -71,6 +115,13 @@ def assemble_main_tex(
     parts.append("")
 
     return "\n".join(parts)
+
+
+def write_supplementary_tex(content: str, output_dir: Path) -> None:
+    """Write supplementary.tex to output_dir."""
+    path = output_dir / "supplementary.tex"
+    path.write_text(content, encoding="utf-8")
+    logger.info("Wrote %s", path)
 
 
 def write_section_files(section_latex: dict[str, str], output_dir: Path) -> None:

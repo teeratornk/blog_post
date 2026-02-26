@@ -53,6 +53,8 @@ vector_db_enabled: true
 timeout: 120
 seed: 42
 
+supplementary_mode: auto
+
 enabled_reviewers:
   DesignReviewer: true
   ConsistencyChecker: true

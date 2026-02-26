@@ -112,6 +112,7 @@ def build_role_llm_config(role: str, config: ProjectConfig) -> dict[str, Any]:
         "design_planner": models.planner,
         "advisor": models.advisor,
         "infra_advisor": models.advisor,
+        "page_budget": models.reviewer,
     }
     chosen = role_map.get(role.lower()) or models.default
     entry = _build_single_entry(chosen, config.azure)

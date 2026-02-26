@@ -24,6 +24,7 @@ from .agents.doc_analyzer import make_doc_analyzer
 from .agents.gap_analyzer import make_gap_analyzer
 from .agents.infra_advisor import make_infra_advisor
 from .agents.latex_assembler import make_assembler
+from .agents.page_budget_manager import make_page_budget_manager
 from .agents.understanding_reviewer import make_understanding_reviewer
 from .config import build_role_llm_config
 from .logging_config import PipelineCallbacks, RichCallbacks, logger
@@ -37,9 +38,11 @@ from .models import (
     GapReport,
     PipelinePhase,
     PipelineResult,
+    PlanAction,
     ProjectConfig,
     ReviewFeedback,
     Severity,
+    SplitDecision,
     UnderstandingReport,
     UserFeedback,
 )
@@ -47,9 +50,11 @@ from .tools.compiler import extract_error_context, run_latexmk
 from .tools.doc_reader import chunk_all_documents, list_doc_files, read_document, total_size_kb
 from .tools.latex_builder import (
     assemble_main_tex,
+    assemble_supplementary_tex,
     generate_preamble,
     write_main_tex,
     write_section_files,
+    write_supplementary_tex,
 )
 from .tools.page_counter import count_pages
 from .tools.pandoc_converter import convert_markdown_string_to_latex
@@ -138,6 +143,7 @@ class Pipeline:
         self.section_markdown: dict[str, str] = {}   # section_id -> markdown
         self.section_latex: dict[str, str] = {}       # section_id -> polished LaTeX
         self.compilation_result: CompilationResult | None = None
+        self.split_decision: SplitDecision | None = None
         self.manifest: BuildManifest | None = None
         self.vector_db_dir: Path | None = None
 
@@ -310,41 +316,52 @@ class Pipeline:
     # Phase 3: Design Generation
     # -----------------------------------------------------------------------
 
-    def run_design(self) -> DesignPlan:
-        """Phase 3: Plan, write, review, compile the design document."""
+    def run_plan(self, revision_feedback: str | None = None) -> DesignPlan:
+        """Create (or revise) the design plan without writing sections.
+
+        Parameters
+        ----------
+        revision_feedback : str | None
+            If provided, the prior plan and this feedback are included in the
+            prompt so the planner can revise.
+        """
         if not self.understanding_report:
             raise RuntimeError("Must run understanding phase first")
 
-        self.callbacks.on_phase_start("DESIGN", "Generating design document")
+        self.callbacks.on_phase_start("PLAN", "Creating design plan")
         orchestrator = _make_orchestrator()
 
-        # Step 1: DesignPlanner produces a DesignPlan
         planner = make_design_planner(self.config, style_context=self.style_context)
 
         understanding_summary = ""
         for doc in self.understanding_report.documents:
             understanding_summary += f"- {doc.title}: {doc.summary}\n"
 
-        response = orchestrator.initiate_chat(
-            planner,
-            message=(
-                f"Create a design plan for: {self.config.project_name}\n\n"
-                f"Style: {self.config.style}\n"
-                f"Max pages: {self.config.max_pages or 'unset'}\n"
-                f"Target audience: {self.config.target_audience}\n"
-                f"Tech stack: {', '.join(self.config.tech_stack) or 'unspecified'}\n"
-                f"Infrastructure: {self.config.infrastructure.provider or 'unspecified'}\n"
-                f"Constraints: {', '.join(self.config.constraints) or 'none'}\n\n"
-                f"Source document summaries:\n{understanding_summary}\n\n"
-                f"Gap report confidence: {self.understanding_report.gap_report.confidence_score}\n"
-                f"Cross-references: {', '.join(self.understanding_report.cross_references)}"
-            ),
-            max_turns=1,
+        prompt = (
+            f"Create a design plan for: {self.config.project_name}\n\n"
+            f"Style: {self.config.style}\n"
+            f"Max pages: {self.config.max_pages or 'unset'}\n"
+            f"Target audience: {self.config.target_audience}\n"
+            f"Tech stack: {', '.join(self.config.tech_stack) or 'unspecified'}\n"
+            f"Infrastructure: {self.config.infrastructure.provider or 'unspecified'}\n"
+            f"Constraints: {', '.join(self.config.constraints) or 'none'}\n\n"
+            f"Source document summaries:\n{understanding_summary}\n\n"
+            f"Gap report confidence: {self.understanding_report.gap_report.confidence_score}\n"
+            f"Cross-references: {', '.join(self.understanding_report.cross_references)}"
         )
+
+        if revision_feedback and self.design_plan:
+            prompt += (
+                f"\n\nPREVIOUS PLAN (needs revision):\n"
+                f"{self.design_plan.model_dump_json(indent=2)}\n\n"
+                f"USER FEEDBACK:\n{revision_feedback}\n\n"
+                f"Please revise the plan based on the feedback above."
+            )
+
+        response = orchestrator.initiate_chat(planner, message=prompt, max_turns=1)
 
         plan = _extract_json(response, DesignPlan)
         if plan is None:
-            # Fallback: create plan from style template
             logger.warning("LLM planning failed, creating plan from style template")
             template = load_style_template(self.config.style)
             sections = []
@@ -363,16 +380,57 @@ class Pipeline:
                 page_budget=self.config.max_pages,
             )
 
+        # Assign word limits based on page budget
+        self._assign_word_limits(plan)
         self.design_plan = plan
 
-        # Step 2: Write each section
+        self.callbacks.on_phase_end("PLAN", True)
+        return plan
+
+    def _assign_word_limits(self, plan: DesignPlan) -> None:
+        """Compute per-section word limits from page budget."""
+        max_pages = self.config.max_pages
+        if not max_pages:
+            return
+
+        total_words = max_pages * self.config.words_per_page
+        total_estimated = plan.total_estimated_pages or sum(
+            s.estimated_pages for s in plan.sections
+        )
+        if total_estimated <= 0:
+            return
+
+        for section in plan.sections:
+            ratio = section.estimated_pages / total_estimated
+            section.target_word_count = int(ratio * total_words)
+
+    def run_writing(self) -> DesignPlan:
+        """Write, review, convert, and compile all sections.
+
+        Assumes ``run_plan()`` has already been called and ``self.design_plan``
+        is populated.
+        """
+        if not self.design_plan:
+            raise RuntimeError("Must run plan phase first")
+
+        self.callbacks.on_phase_start("WRITING", "Writing design document")
+        orchestrator = _make_orchestrator()
+        plan = self.design_plan
+
         writer = make_design_writer(self.config)
 
         for section in plan.sections:
             self.callbacks.on_section_start(section.section_id)
 
-            # Build context for writer
             context = self._build_section_context(section)
+
+            # Inject word limit if assigned
+            word_limit_note = ""
+            if section.target_word_count:
+                word_limit_note = (
+                    f"\nWORD LIMIT: ~{section.target_word_count} words "
+                    f"(~{section.estimated_pages:.1f} pages). Stay within this budget.\n"
+                )
 
             response = orchestrator.initiate_chat(
                 writer,
@@ -380,7 +438,8 @@ class Pipeline:
                     f"Write the '{section.title}' section for the ML system design document.\n\n"
                     f"Content guidance: {section.content_guidance}\n"
                     f"Estimated pages: {section.estimated_pages}\n"
-                    f"Target audience: {self.config.target_audience}\n\n"
+                    f"Target audience: {self.config.target_audience}\n"
+                    f"{word_limit_note}\n"
                     f"Context from source documents:\n{context}"
                 ),
                 max_turns=1,
@@ -389,10 +448,10 @@ class Pipeline:
             markdown = _extract_text(response)
             self.section_markdown[section.section_id] = markdown
 
-            # Step 3: Review section
+            # Review section
             review_feedback = self._review_section(section.section_id, markdown, orchestrator)
 
-            # Step 4: If issues found, rewrite
+            # If issues found, rewrite
             if review_feedback and any(
                 r.severity in (Severity.ERROR, Severity.CRITICAL) for r in review_feedback
             ):
@@ -413,14 +472,22 @@ class Pipeline:
 
             self.callbacks.on_section_end(section.section_id)
 
-        # Step 5: Cross-review
+        # Cross-review
         self._cross_review(orchestrator)
 
-        # Step 6: Convert markdown -> LaTeX
+        # Convert markdown -> LaTeX and compile
         self._convert_and_compile(orchestrator)
 
-        self.callbacks.on_phase_end("DESIGN", True)
+        self.callbacks.on_phase_end("WRITING", True)
         return plan
+
+    def run_design(self) -> DesignPlan:
+        """Phase 3: Plan, write, review, compile the design document.
+
+        Legacy method that combines ``run_plan()`` + ``run_writing()``.
+        """
+        self.run_plan()
+        return self.run_writing()
 
     def _build_section_context(self, section: DesignSection) -> str:
         """Build context for section writing from understanding report + vector DB."""
@@ -663,6 +730,137 @@ class Pipeline:
             self.compilation_result = result
 
     # -----------------------------------------------------------------------
+    # Page Budget Enforcement
+    # -----------------------------------------------------------------------
+
+    def _is_supplementary_enabled(self, page_count: int) -> bool:
+        """Decide whether supplementary material generation should activate."""
+        mode = self.config.supplementary_mode
+        if mode in ("appendix", "standalone"):
+            return True
+        if mode == "auto" and self.config.max_pages:
+            ratio = page_count / self.config.max_pages
+            return ratio > self.config.supplementary_threshold
+        return False
+
+    def run_page_budget(self) -> SplitDecision:
+        """Check compiled page count against budget, optionally plan a split."""
+        self.callbacks.on_phase_start("PAGE_BUDGET", "Checking page budget")
+
+        if not self.config.max_pages:
+            decision = SplitDecision(action="ok")
+            self.split_decision = decision
+            self.callbacks.on_phase_end("PAGE_BUDGET", True)
+            return decision
+
+        page_count = 0
+        if self.compilation_result and self.compilation_result.page_count:
+            page_count = self.compilation_result.page_count
+
+        if page_count <= self.config.max_pages:
+            decision = SplitDecision(
+                action="ok",
+                current_pages=page_count,
+                budget_pages=self.config.max_pages,
+            )
+            self.split_decision = decision
+            self.callbacks.on_phase_end("PAGE_BUDGET", True)
+            return decision
+
+        # Over budget — call PageBudgetManager
+        supplementary = self._is_supplementary_enabled(page_count)
+        orchestrator = _make_orchestrator()
+        agent = make_page_budget_manager(
+            self.config, supplementary_enabled=supplementary,
+        )
+
+        sections_info = ""
+        if self.design_plan:
+            for s in self.design_plan.sections:
+                sections_info += (
+                    f"- {s.section_id}: {s.title} "
+                    f"(est. {s.estimated_pages:.1f} pages, priority={s.priority})\n"
+                )
+
+        response = orchestrator.initiate_chat(
+            agent,
+            message=(
+                f"The compiled document is {page_count} pages but the budget is "
+                f"{self.config.max_pages} pages.\n\n"
+                f"Sections:\n{sections_info}\n"
+                f"Please recommend how to bring this within budget."
+            ),
+            max_turns=1,
+        )
+
+        decision = _extract_json(response, SplitDecision)
+        if decision is None:
+            decision = SplitDecision(
+                action="warn_over",
+                current_pages=page_count,
+                budget_pages=self.config.max_pages,
+                recommendations="PageBudgetManager could not produce a plan.",
+            )
+
+        self.split_decision = decision
+        self.callbacks.on_phase_end("PAGE_BUDGET", True)
+        return decision
+
+    def run_supplementary(self) -> CompilationResult | None:
+        """Move overflow sections to appendix/standalone and recompile."""
+        if not self.split_decision or self.split_decision.action != "split":
+            return None
+        plan = self.split_decision.supplementary_plan
+        if not plan:
+            return None
+
+        self.callbacks.on_phase_start("SUPPLEMENTARY", "Building supplementary materials")
+
+        preamble = generate_preamble(title=self.config.project_name)
+
+        if plan.mode == "appendix":
+            # Rebuild main.tex with appendix sections
+            all_ids = list(self.section_latex.keys())
+            main_tex = assemble_main_tex(
+                preamble,
+                all_ids,
+                title=self.config.project_name,
+                appendix_ids=plan.supplementary_sections,
+            )
+            write_main_tex(main_tex, self.output_dir)
+        else:
+            # Standalone mode: main without supplementary, separate doc
+            main_ids = [s for s in self.section_latex if s not in set(plan.supplementary_sections)]
+            main_tex = assemble_main_tex(
+                preamble, main_ids, title=self.config.project_name,
+            )
+            write_main_tex(main_tex, self.output_dir)
+
+            supp_tex = assemble_supplementary_tex(
+                preamble, plan.supplementary_sections,
+                project_name=self.config.project_name,
+            )
+            write_supplementary_tex(supp_tex, self.output_dir)
+
+        # Insert cross-reference note in last main section
+        main_section_ids = plan.main_sections
+        if main_section_ids:
+            last_main = main_section_ids[-1]
+            if last_main in self.section_latex:
+                note = f"\n\n\\paragraph{{Supplementary Materials.}} {plan.cross_reference_note}\n"
+                self.section_latex[last_main] += note
+                write_section_files(
+                    {last_main: self.section_latex[last_main]}, self.output_dir,
+                )
+
+        # Recompile main
+        result = run_latexmk(self.output_dir)
+        self.compilation_result = result
+
+        self.callbacks.on_phase_end("SUPPLEMENTARY", result.success)
+        return result
+
+    # -----------------------------------------------------------------------
     # Phase 4: User Review
     # -----------------------------------------------------------------------
 
@@ -742,6 +940,23 @@ class Pipeline:
 
         section_file_list = [f"sections/{sid}.tex" for sid in self.section_latex]
 
+        # Supplementary info
+        supp_tex: str | None = None
+        supp_pdf: str | None = None
+        supp_sections: list[str] = []
+        if (
+            self.split_decision
+            and self.split_decision.supplementary_plan
+            and self.split_decision.action == "split"
+        ):
+            sp = self.split_decision.supplementary_plan
+            supp_sections = sp.supplementary_sections
+            if sp.mode == "standalone":
+                supp_tex = "supplementary.tex"
+                supp_pdf_path = self.output_dir / "supplementary.pdf"
+                if supp_pdf_path.exists():
+                    supp_pdf = str(supp_pdf_path)
+
         self.manifest = BuildManifest(
             project_name=self.config.project_name,
             output_dir=str(self.output_dir),
@@ -752,6 +967,9 @@ class Pipeline:
             compilation_attempts=self.config.compile_max_attempts,
             page_count=self.compilation_result.page_count if self.compilation_result else None,
             warnings=warnings,
+            supplementary_tex=supp_tex,
+            supplementary_pdf=supp_pdf,
+            supplementary_sections=supp_sections,
         )
 
         manifest_path = self.output_dir / "manifest.json"
@@ -768,11 +986,19 @@ class Pipeline:
     # -----------------------------------------------------------------------
 
     def run(self) -> PipelineResult:
-        """Run the full 4-phase pipeline."""
+        """Run the full pipeline with plan-first workflow.
+
+        Flow::
+
+            CONFIGURATION → UNDERSTANDING → PLAN → [PLAN APPROVAL] →
+            WRITING+REVIEW → COMPILE → PAGE_BUDGET → SUPPLEMENTARY →
+            USER REVIEW → FINALIZE
+        """
         errors: list[str] = []
         phases: list[PipelinePhase] = []
 
         try:
+            # Phase 1: Configuration
             validation = self.run_configuration()
             phases.append(PipelinePhase.CONFIGURATION)
             if not validation.valid:
@@ -782,13 +1008,45 @@ class Pipeline:
                     phases_completed=phases,
                 )
 
+            # Phase 2: Understanding
             self.run_understanding()
             phases.append(PipelinePhase.UNDERSTANDING)
 
-            self.run_design()
+            # Phase 3a: Plan
+            self.run_plan()
+
+            # Plan approval loop
+            for _ in range(self.config.max_plan_revisions):
+                review = self.callbacks.on_plan_approval(self.design_plan)
+                phases.append(PipelinePhase.PLAN_APPROVAL)
+
+                if review.action == PlanAction.APPROVE:
+                    break
+                elif review.action == PlanAction.ABORT:
+                    return PipelineResult(
+                        success=False,
+                        understanding_report=self.understanding_report,
+                        design_plan=self.design_plan,
+                        errors=["Pipeline aborted by user during plan approval"],
+                        phases_completed=phases,
+                    )
+                elif review.action == PlanAction.REVISE:
+                    self.run_plan(revision_feedback=review.feedback)
+
+            # Phase 3b: Writing + review + compile
+            self.run_writing()
             phases.append(PipelinePhase.DESIGN)
 
-            # Plan approval gate
+            # Phase 4: Page budget check
+            self.run_page_budget()
+            phases.append(PipelinePhase.PAGE_BUDGET)
+
+            # Phase 5: Supplementary material (if split was decided)
+            self.run_supplementary()
+            if self.split_decision and self.split_decision.action == "split":
+                phases.append(PipelinePhase.SUPPLEMENTARY)
+
+            # Phase 6: User review loop (on compiled document)
             for _ in range(self.config.design_revision_max_rounds):
                 feedback = self.run_user_review()
                 phases.append(PipelinePhase.USER_REVIEW)
@@ -801,10 +1059,12 @@ class Pipeline:
                         understanding_report=self.understanding_report,
                         design_plan=self.design_plan,
                         compilation_result=self.compilation_result,
+                        split_decision=self.split_decision,
                         errors=["Pipeline aborted by user during review"],
                         phases_completed=phases,
                     )
 
+            # Phase 7: Finalization
             self.run_finalization()
 
         except Exception as e:
@@ -824,6 +1084,7 @@ class Pipeline:
             output_dir=str(self.output_dir),
             errors=errors,
             phases_completed=phases,
+            split_decision=self.split_decision,
         )
 
     # -----------------------------------------------------------------------
@@ -836,8 +1097,8 @@ class Pipeline:
         return self.run_understanding()
 
     def run_plan_only(self) -> tuple[UnderstandingReport, DesignPlan]:
-        """Run Phase 1 + 2 + plan step of Phase 3."""
+        """Run Phase 1 + 2 + plan step (no writing)."""
         self.run_configuration()
         report = self.run_understanding()
-        plan = self.run_design()
+        plan = self.run_plan()
         return report, plan

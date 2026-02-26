@@ -23,7 +23,16 @@ class PipelinePhase(str, Enum):
     CONFIGURATION = "configuration"
     UNDERSTANDING = "understanding"
     DESIGN = "design"
+    PLAN_APPROVAL = "plan_approval"
+    PAGE_BUDGET = "page_budget"
+    SUPPLEMENTARY = "supplementary"
     USER_REVIEW = "user_review"
+
+
+class PlanAction(str, Enum):
+    APPROVE = "approve"
+    REVISE = "revise"
+    ABORT = "abort"
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +125,8 @@ class DesignSection(BaseModel):
     content_guidance: str = Field(default="", description="What this section should cover")
     estimated_pages: float = 1.0
     depends_on: list[str] = Field(default_factory=list, description="Other section_ids")
+    priority: int = Field(default=1, description="1=highest priority, higher=lower priority")
+    target_word_count: int | None = Field(default=None, description="Target word count for this section")
 
 
 class DesignPlan(BaseModel):
@@ -156,6 +167,51 @@ class CompilationResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Plan Review
+# ---------------------------------------------------------------------------
+
+class PlanReviewResult(BaseModel):
+    """Result of user reviewing the design plan before writing begins."""
+    action: PlanAction = PlanAction.APPROVE
+    feedback: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Page Budget & Supplementary
+# ---------------------------------------------------------------------------
+
+class SupplementaryClassification(BaseModel):
+    """Classification of a single section as main or supplementary."""
+    section_id: str
+    placement: str = Field(description="'main' or 'supplementary'")
+    reasoning: str = ""
+    priority: int = 1
+    estimated_pages: float = 0.0
+
+
+class SupplementaryPlan(BaseModel):
+    """Plan for splitting content between main and supplementary documents."""
+    mode: str = Field(default="appendix", description="'appendix' or 'standalone'")
+    main_sections: list[str] = Field(default_factory=list)
+    supplementary_sections: list[str] = Field(default_factory=list)
+    classifications: list[SupplementaryClassification] = Field(default_factory=list)
+    estimated_main_pages: float = 0.0
+    estimated_supp_pages: float = 0.0
+    cross_reference_note: str = "See Appendix for additional details."
+
+
+class SplitDecision(BaseModel):
+    """Decision from the PageBudgetManager agent."""
+    action: str = Field(description="'ok', 'warn_over', or 'split'")
+    current_pages: int = 0
+    budget_pages: int | None = None
+    sections_to_move: list[str] = Field(default_factory=list)
+    estimated_savings: float = 0.0
+    recommendations: str = ""
+    supplementary_plan: SupplementaryPlan | None = None
+
+
+# ---------------------------------------------------------------------------
 # Phase 4: User Review
 # ---------------------------------------------------------------------------
 
@@ -183,6 +239,9 @@ class BuildManifest(BaseModel):
     review_rounds: int = 0
     page_count: int | None = None
     warnings: list[str] = Field(default_factory=list)
+    supplementary_tex: str | None = None
+    supplementary_pdf: str | None = None
+    supplementary_sections: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +257,7 @@ class PipelineResult(BaseModel):
     output_dir: str | None = None
     errors: list[str] = Field(default_factory=list)
     phases_completed: list[PipelinePhase] = Field(default_factory=list)
+    split_decision: SplitDecision | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +293,18 @@ class ProjectConfig(BaseModel):
     vector_db_threshold_kb: int = Field(default=50)
     timeout: int = Field(default=120)
     seed: int = Field(default=42)
+
+    # Page budget & supplementary
+    supplementary_mode: str = Field(
+        default="disabled",
+        description="disabled | auto | appendix | standalone",
+    )
+    supplementary_threshold: float = Field(
+        default=1.3,
+        description="Ratio of actual/budget pages that triggers supplementary (for auto mode)",
+    )
+    max_plan_revisions: int = Field(default=3, description="Max plan revision rounds")
+    words_per_page: int = Field(default=500, description="Estimated words per page for budget")
 
     # Enabled reviewers
     enabled_reviewers: dict[str, bool] = Field(
