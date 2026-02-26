@@ -149,6 +149,36 @@ def _understand_mode(cfg: DictConfig) -> None:
             console.print(f"    [{gap.severity.value}] {gap.area}: {gap.description}")
 
 
+def _discover_mode(cfg: DictConfig) -> None:
+    config = _to_project_config(cfg)
+    config_dir = _get_config_dir()
+
+    from .pipeline import Pipeline
+
+    callbacks = RichCallbacks()
+    pipeline = Pipeline(config, config_dir=config_dir, callbacks=callbacks)
+
+    report, opp_report = pipeline.run_opportunity_only()
+
+    console.print("\n[bold]Understanding Report:[/]")
+    console.print(f"  Documents analyzed: {len(report.documents)}")
+    console.print(f"  Cross-references: {', '.join(report.cross_references) or 'none'}")
+
+    console.print("\n[bold]ML Opportunities:[/]")
+    if opp_report.summary:
+        console.print(f"  {opp_report.summary}")
+    for i, opp in enumerate(opp_report.opportunities, 1):
+        console.print(
+            f"\n  [cyan]{i}. {opp.title}[/] ({opp.opportunity_id})"
+        )
+        console.print(f"     Category: {opp.category}")
+        console.print(f"     Complexity: {opp.estimated_complexity}  |  Impact: {opp.potential_impact}")
+        if opp.description:
+            console.print(f"     {opp.description}")
+        if opp.source_evidence:
+            console.print(f"     Evidence: {', '.join(opp.source_evidence)}")
+
+
 def _compile_mode(cfg: DictConfig) -> None:
     from .tools.compiler import run_latexmk
 
@@ -169,6 +199,7 @@ _MODE_DISPATCH: dict[str, Any] = {
     "run": _run_mode,
     "plan": _plan_mode,
     "understand": _understand_mode,
+    "discover": _discover_mode,
     "compile": _compile_mode,
 }
 

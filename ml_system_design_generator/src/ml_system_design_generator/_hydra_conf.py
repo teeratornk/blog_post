@@ -40,7 +40,7 @@ class InfraConf:
 @dataclass
 class MlsdConf:
     # --- CLI-only fields ---
-    mode: str = "run"                     # run | plan | understand | compile
+    mode: str = "run"                     # run | plan | understand | discover | compile
     no_approve: bool = False
     no_interactive: bool = False
     verbose: bool = False
@@ -74,6 +74,10 @@ class MlsdConf:
     vector_db_threshold_kb: int = 50
     timeout: int = 120
     seed: int = 42
+
+    # Opportunity discovery & feasibility
+    max_opportunities: int = 5
+    feasibility_max_rounds: int = 2
 
     # Page budget & supplementary
     supplementary_mode: str = "disabled"

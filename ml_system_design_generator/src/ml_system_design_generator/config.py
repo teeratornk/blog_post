@@ -112,6 +112,8 @@ def build_role_llm_config(role: str, config: ProjectConfig) -> dict[str, Any]:
         "design_planner": models.planner,
         "advisor": models.advisor,
         "infra_advisor": models.advisor,
+        "opportunity_analyzer": models.analyzer,
+        "feasibility_assessor": models.advisor,
         "page_budget": models.reviewer,
     }
     chosen = role_map.get(role.lower()) or models.default

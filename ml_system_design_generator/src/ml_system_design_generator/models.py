@@ -22,6 +22,8 @@ class Severity(str, Enum):
 class PipelinePhase(str, Enum):
     CONFIGURATION = "configuration"
     UNDERSTANDING = "understanding"
+    OPPORTUNITY_DISCOVERY = "opportunity_discovery"
+    FEASIBILITY_CHECK = "feasibility_check"
     DESIGN = "design"
     PLAN_APPROVAL = "plan_approval"
     PAGE_BUDGET = "page_budget"
@@ -112,6 +114,62 @@ class UnderstandingReport(BaseModel):
     gap_report: GapReport = Field(default_factory=GapReport)
     vector_db_created: bool = False
     total_chunks: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b: Opportunity Discovery
+# ---------------------------------------------------------------------------
+
+class Opportunity(BaseModel):
+    """A single ML solution direction proposed by the OpportunityAnalyzer."""
+    opportunity_id: str = Field(description="Slug e.g. 'anomaly_detection'")
+    title: str = Field(description="e.g. 'Anomaly Detection System'")
+    category: str = Field(default="", description="classification, anomaly_detection, agentic_ai, forecasting, etc.")
+    description: str = Field(default="", description="2-3 sentence description")
+    source_evidence: list[str] = Field(default_factory=list, description="Doc titles that support this")
+    estimated_complexity: str = Field(default="medium", description="low | medium | high")
+    potential_impact: str = Field(default="medium", description="low | medium | high")
+
+
+class OpportunityReport(BaseModel):
+    """Collection of ML opportunities discovered from source docs."""
+    opportunities: list[Opportunity] = Field(default_factory=list)
+    summary: str = ""
+
+
+class OpportunitySelectionAction(str, Enum):
+    SELECT = "select"
+    CUSTOM = "custom"
+    ABORT = "abort"
+
+
+class OpportunitySelection(BaseModel):
+    """User's selection from the opportunity report."""
+    action: OpportunitySelectionAction = OpportunitySelectionAction.SELECT
+    selected_ids: list[str] = Field(default_factory=list)
+    custom_opportunity: str = ""
+    combination_note: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c: Feasibility Check
+# ---------------------------------------------------------------------------
+
+class FeasibilityItem(BaseModel):
+    """A single feasibility assessment dimension."""
+    area: str = Field(description="e.g. 'Data Availability', 'Compute Cost'")
+    assessment: str = Field(default="")
+    risk_level: str = Field(default="low", description="none | low | medium | high | critical")
+    mitigation: str = ""
+
+
+class FeasibilityReport(BaseModel):
+    """Feasibility assessment of selected ML opportunities."""
+    selected_opportunities: list[str] = Field(default_factory=list)
+    items: list[FeasibilityItem] = Field(default_factory=list)
+    overall_feasible: bool = True
+    overall_summary: str = ""
+    recommendations: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +310,9 @@ class PipelineResult(BaseModel):
     """Top-level result of the full pipeline run."""
     success: bool
     understanding_report: UnderstandingReport | None = None
+    opportunity_report: OpportunityReport | None = None
+    opportunity_selection: OpportunitySelection | None = None
+    feasibility_report: FeasibilityReport | None = None
     design_plan: DesignPlan | None = None
     compilation_result: CompilationResult | None = None
     output_dir: str | None = None
@@ -293,6 +354,10 @@ class ProjectConfig(BaseModel):
     vector_db_threshold_kb: int = Field(default=50)
     timeout: int = Field(default=120)
     seed: int = Field(default=42)
+
+    # Opportunity discovery & feasibility
+    max_opportunities: int = Field(default=5, description="Max ML directions to propose")
+    feasibility_max_rounds: int = Field(default=2, description="Max retries for feasibility parsing")
 
     # Page budget & supplementary
     supplementary_mode: str = Field(

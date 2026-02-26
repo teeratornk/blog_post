@@ -21,9 +21,11 @@ from .agents.design_planner import make_design_planner
 from .agents.design_reviewer import make_design_reviewer, validate_review
 from .agents.design_writer import make_design_writer
 from .agents.doc_analyzer import make_doc_analyzer
+from .agents.feasibility_assessor import make_feasibility_assessor
 from .agents.gap_analyzer import make_gap_analyzer
 from .agents.infra_advisor import make_infra_advisor
 from .agents.latex_assembler import make_assembler
+from .agents.opportunity_analyzer import make_opportunity_analyzer
 from .agents.page_budget_manager import make_page_budget_manager
 from .agents.understanding_reviewer import make_understanding_reviewer
 from .config import build_role_llm_config
@@ -35,7 +37,12 @@ from .models import (
     DesignPlan,
     DesignSection,
     DocumentSummary,
+    FeasibilityReport,
     GapReport,
+    Opportunity,
+    OpportunityReport,
+    OpportunitySelection,
+    OpportunitySelectionAction,
     PipelinePhase,
     PipelineResult,
     PlanAction,
@@ -139,6 +146,9 @@ class Pipeline:
 
         # State
         self.understanding_report: UnderstandingReport | None = None
+        self.opportunity_report: OpportunityReport | None = None
+        self.opportunity_selection: OpportunitySelection | None = None
+        self.feasibility_report: FeasibilityReport | None = None
         self.design_plan: DesignPlan | None = None
         self.section_markdown: dict[str, str] = {}   # section_id -> markdown
         self.section_latex: dict[str, str] = {}       # section_id -> polished LaTeX
@@ -313,6 +323,168 @@ class Pipeline:
         return self.understanding_report
 
     # -----------------------------------------------------------------------
+    # Phase 2b: Opportunity Discovery
+    # -----------------------------------------------------------------------
+
+    def run_opportunity_discovery(self) -> OpportunityReport:
+        """Propose ML solution directions from the understanding report."""
+        if not self.understanding_report:
+            raise RuntimeError("Must run understanding phase first")
+
+        self.callbacks.on_phase_start(
+            "OPPORTUNITY_DISCOVERY", "Discovering ML opportunities"
+        )
+        orchestrator = _make_orchestrator()
+        analyzer = make_opportunity_analyzer(self.config)
+
+        # Build prompt from understanding report
+        summaries_text = "\n".join(
+            f"- {doc.title}: {doc.summary}" for doc in self.understanding_report.documents
+        )
+        gaps_text = "\n".join(
+            f"- [{g.severity.value}] {g.area}: {g.description}"
+            for g in self.understanding_report.gap_report.gaps
+        )
+
+        context_parts: list[str] = [
+            f"Project: {self.config.project_name}",
+            f"Target audience: {self.config.target_audience}",
+        ]
+        if self.config.infrastructure.provider:
+            context_parts.append(f"Infrastructure: {self.config.infrastructure.provider}")
+        if self.config.tech_stack:
+            context_parts.append(f"Tech stack: {', '.join(self.config.tech_stack)}")
+        if self.config.constraints:
+            context_parts.append(f"Constraints: {', '.join(self.config.constraints)}")
+        if self.config.team_size:
+            context_parts.append(f"Team size: {self.config.team_size}")
+        if self.config.timeline:
+            context_parts.append(f"Timeline: {self.config.timeline}")
+
+        prompt = (
+            f"Analyze the following source documents and propose up to "
+            f"{self.config.max_opportunities} ML solution directions.\n\n"
+            f"PROJECT CONTEXT:\n" + "\n".join(context_parts) + "\n\n"
+            f"DOCUMENT SUMMARIES:\n{summaries_text}\n\n"
+            f"GAP ANALYSIS:\n{gaps_text or 'No gaps identified.'}\n\n"
+            f"Cross-references: {', '.join(self.understanding_report.cross_references) or 'none'}"
+        )
+
+        response = orchestrator.initiate_chat(analyzer, message=prompt, max_turns=1)
+        report = _extract_json(response, OpportunityReport)
+
+        if report is None:
+            # Fallback: generic opportunity
+            logger.warning("OpportunityAnalyzer failed, creating generic opportunity")
+            report = OpportunityReport(
+                opportunities=[
+                    Opportunity(
+                        opportunity_id="ml_system_design",
+                        title="ML System Design",
+                        category="general",
+                        description="General ML system design based on source documents.",
+                        estimated_complexity="medium",
+                        potential_impact="medium",
+                    )
+                ],
+                summary="Fallback: could not parse LLM response.",
+            )
+
+        self.opportunity_report = report
+        self.callbacks.on_phase_end("OPPORTUNITY_DISCOVERY", True)
+        return report
+
+    # -----------------------------------------------------------------------
+    # Phase 2c: Feasibility Check
+    # -----------------------------------------------------------------------
+
+    def run_feasibility_check(self) -> FeasibilityReport:
+        """Assess feasibility of selected ML opportunities."""
+        if not self.opportunity_selection:
+            raise RuntimeError("Must select opportunities first")
+
+        self.callbacks.on_phase_start(
+            "FEASIBILITY_CHECK", "Assessing feasibility"
+        )
+        orchestrator = _make_orchestrator()
+        assessor = make_feasibility_assessor(self.config)
+
+        # Build description of selected opportunities
+        selected_desc = ""
+        if (
+            self.opportunity_selection.action == OpportunitySelectionAction.CUSTOM
+            and self.opportunity_selection.custom_opportunity
+        ):
+            selected_desc = f"Custom direction: {self.opportunity_selection.custom_opportunity}"
+            selected_ids = ["custom"]
+        elif self.opportunity_report:
+            selected_ids = self.opportunity_selection.selected_ids
+            by_id = {o.opportunity_id: o for o in self.opportunity_report.opportunities}
+            parts: list[str] = []
+            for oid in selected_ids:
+                opp = by_id.get(oid)
+                if opp:
+                    parts.append(f"- {opp.title} ({opp.opportunity_id}): {opp.description}")
+            selected_desc = "\n".join(parts)
+        else:
+            selected_ids = self.opportunity_selection.selected_ids
+            selected_desc = f"Selected IDs: {', '.join(selected_ids)}"
+
+        if self.opportunity_selection.combination_note:
+            selected_desc += f"\nCombination guidance: {self.opportunity_selection.combination_note}"
+
+        context_parts: list[str] = [
+            f"Project: {self.config.project_name}",
+        ]
+        if self.config.infrastructure.provider:
+            ctx = f"Infrastructure: {self.config.infrastructure.provider}"
+            if self.config.infrastructure.compute:
+                ctx += f", Compute: {', '.join(self.config.infrastructure.compute)}"
+            if self.config.infrastructure.storage:
+                ctx += f", Storage: {', '.join(self.config.infrastructure.storage)}"
+            if self.config.infrastructure.services:
+                ctx += f", Services: {', '.join(self.config.infrastructure.services)}"
+            context_parts.append(ctx)
+        if self.config.tech_stack:
+            context_parts.append(f"Tech stack: {', '.join(self.config.tech_stack)}")
+        if self.config.team_size:
+            context_parts.append(f"Team size: {self.config.team_size}")
+        if self.config.timeline:
+            context_parts.append(f"Timeline: {self.config.timeline}")
+        if self.config.constraints:
+            context_parts.append(f"Constraints: {', '.join(self.config.constraints)}")
+
+        prompt = (
+            f"Assess the feasibility of the following ML direction(s).\n\n"
+            f"SELECTED OPPORTUNITIES:\n{selected_desc}\n\n"
+            f"PROJECT CONTEXT:\n" + "\n".join(context_parts)
+        )
+
+        report: FeasibilityReport | None = None
+        for attempt in range(self.config.feasibility_max_rounds):
+            response = orchestrator.initiate_chat(assessor, message=prompt, max_turns=1)
+            report = _extract_json(response, FeasibilityReport)
+            if report is not None:
+                break
+            logger.warning(
+                "Feasibility parse attempt %d/%d failed",
+                attempt + 1,
+                self.config.feasibility_max_rounds,
+            )
+
+        if report is None:
+            logger.warning("FeasibilityAssessor failed, creating inconclusive report")
+            report = FeasibilityReport(
+                selected_opportunities=selected_ids,
+                overall_feasible=True,
+                overall_summary="Feasibility assessment inconclusive — proceeding with caution.",
+            )
+
+        self.feasibility_report = report
+        self.callbacks.on_phase_end("FEASIBILITY_CHECK", True)
+        return report
+
+    # -----------------------------------------------------------------------
     # Phase 3: Design Generation
     # -----------------------------------------------------------------------
 
@@ -349,6 +521,45 @@ class Pipeline:
             f"Gap report confidence: {self.understanding_report.gap_report.confidence_score}\n"
             f"Cross-references: {', '.join(self.understanding_report.cross_references)}"
         )
+
+        # Inject opportunity & feasibility context if available
+        if self.opportunity_selection and self.opportunity_report:
+            direction_lines: list[str] = []
+            if self.opportunity_selection.action == OpportunitySelectionAction.CUSTOM:
+                direction_lines.append(
+                    f"- Custom: {self.opportunity_selection.custom_opportunity}"
+                )
+            else:
+                by_id = {
+                    o.opportunity_id: o
+                    for o in self.opportunity_report.opportunities
+                }
+                for oid in self.opportunity_selection.selected_ids:
+                    opp = by_id.get(oid)
+                    if opp:
+                        direction_lines.append(f"- {opp.title}: {opp.description}")
+            if self.opportunity_selection.combination_note:
+                direction_lines.append(
+                    f"Combination guidance: {self.opportunity_selection.combination_note}"
+                )
+            prompt += (
+                f"\n\nSELECTED ML DIRECTION(S):\n" + "\n".join(direction_lines)
+            )
+
+        if self.feasibility_report:
+            fr = self.feasibility_report
+            risk_lines = [
+                f"  - [{item.risk_level}] {item.area}: {item.assessment}"
+                for item in fr.items
+                if item.risk_level in ("medium", "high", "critical")
+            ]
+            prompt += (
+                f"\n\nFEASIBILITY ASSESSMENT:\n"
+                f"Overall feasible: {fr.overall_feasible}\n"
+                f"Summary: {fr.overall_summary}\n"
+            )
+            if risk_lines:
+                prompt += "Key risks to address in design:\n" + "\n".join(risk_lines)
 
         if revision_feedback and self.design_plan:
             prompt += (
@@ -1012,6 +1223,45 @@ class Pipeline:
             self.run_understanding()
             phases.append(PipelinePhase.UNDERSTANDING)
 
+            # Phase 2b: Opportunity Discovery
+            self.run_opportunity_discovery()
+            phases.append(PipelinePhase.OPPORTUNITY_DISCOVERY)
+
+            # Phase 2c: Opportunity selection + feasibility loop
+            for _ in range(self.config.max_plan_revisions):
+                selection = self.callbacks.on_opportunity_review(self.opportunity_report)
+                self.opportunity_selection = selection
+
+                if selection.action == OpportunitySelectionAction.ABORT:
+                    return PipelineResult(
+                        success=False,
+                        understanding_report=self.understanding_report,
+                        opportunity_report=self.opportunity_report,
+                        errors=["Pipeline aborted by user during opportunity selection"],
+                        phases_completed=phases,
+                    )
+
+                self.run_feasibility_check()
+                phases.append(PipelinePhase.FEASIBILITY_CHECK)
+
+                feasibility_review = self.callbacks.on_feasibility_review(
+                    self.feasibility_report
+                )
+
+                if feasibility_review.action == PlanAction.APPROVE:
+                    break
+                elif feasibility_review.action == PlanAction.ABORT:
+                    return PipelineResult(
+                        success=False,
+                        understanding_report=self.understanding_report,
+                        opportunity_report=self.opportunity_report,
+                        opportunity_selection=self.opportunity_selection,
+                        feasibility_report=self.feasibility_report,
+                        errors=["Pipeline aborted by user during feasibility review"],
+                        phases_completed=phases,
+                    )
+                # PlanAction.REVISE → loop back to re-select opportunities
+
             # Phase 3a: Plan
             self.run_plan()
 
@@ -1026,6 +1276,9 @@ class Pipeline:
                     return PipelineResult(
                         success=False,
                         understanding_report=self.understanding_report,
+                        opportunity_report=self.opportunity_report,
+                        opportunity_selection=self.opportunity_selection,
+                        feasibility_report=self.feasibility_report,
                         design_plan=self.design_plan,
                         errors=["Pipeline aborted by user during plan approval"],
                         phases_completed=phases,
@@ -1057,6 +1310,9 @@ class Pipeline:
                     return PipelineResult(
                         success=False,
                         understanding_report=self.understanding_report,
+                        opportunity_report=self.opportunity_report,
+                        opportunity_selection=self.opportunity_selection,
+                        feasibility_report=self.feasibility_report,
                         design_plan=self.design_plan,
                         compilation_result=self.compilation_result,
                         split_decision=self.split_decision,
@@ -1079,6 +1335,9 @@ class Pipeline:
         return PipelineResult(
             success=success,
             understanding_report=self.understanding_report,
+            opportunity_report=self.opportunity_report,
+            opportunity_selection=self.opportunity_selection,
+            feasibility_report=self.feasibility_report,
             design_plan=self.design_plan,
             compilation_result=self.compilation_result,
             output_dir=str(self.output_dir),
@@ -1095,6 +1354,13 @@ class Pipeline:
         """Run only Phase 1 + 2 (config + understanding)."""
         self.run_configuration()
         return self.run_understanding()
+
+    def run_opportunity_only(self) -> tuple[UnderstandingReport, OpportunityReport]:
+        """Run Phase 1 + 2 + opportunity discovery (no feasibility/plan)."""
+        self.run_configuration()
+        report = self.run_understanding()
+        opp_report = self.run_opportunity_discovery()
+        return report, opp_report
 
     def run_plan_only(self) -> tuple[UnderstandingReport, DesignPlan]:
         """Run Phase 1 + 2 + plan step (no writing)."""

@@ -11,10 +11,16 @@ from ml_system_design_generator.models import (
     DesignPlan,
     DesignSection,
     DocumentSummary,
+    FeasibilityItem,
+    FeasibilityReport,
     GapItem,
     GapReport,
     InfrastructureConfig,
     ModelConfig,
+    Opportunity,
+    OpportunityReport,
+    OpportunitySelection,
+    OpportunitySelectionAction,
     PipelinePhase,
     PipelineResult,
     PlanAction,
@@ -353,8 +359,230 @@ class TestProjectConfigExtended:
         assert config.supplementary_threshold == 1.5
 
 
+class TestOpportunity:
+    def test_creation(self):
+        opp = Opportunity(
+            opportunity_id="anomaly_detection",
+            title="Anomaly Detection System",
+            category="anomaly_detection",
+            description="Build a real-time anomaly detection system.",
+            source_evidence=["Doc A", "Doc B"],
+            estimated_complexity="medium",
+            potential_impact="high",
+        )
+        assert opp.opportunity_id == "anomaly_detection"
+        assert opp.title == "Anomaly Detection System"
+        assert opp.potential_impact == "high"
+        assert len(opp.source_evidence) == 2
+
+    def test_defaults(self):
+        opp = Opportunity(opportunity_id="test", title="Test")
+        assert opp.category == ""
+        assert opp.estimated_complexity == "medium"
+        assert opp.potential_impact == "medium"
+        assert opp.source_evidence == []
+
+    def test_json_roundtrip(self):
+        opp = Opportunity(
+            opportunity_id="pred_maint",
+            title="Predictive Maintenance",
+            category="forecasting",
+            description="Predict equipment failures.",
+            estimated_complexity="high",
+            potential_impact="high",
+        )
+        json_str = opp.model_dump_json()
+        parsed = Opportunity.model_validate_json(json_str)
+        assert parsed.opportunity_id == "pred_maint"
+        assert parsed.category == "forecasting"
+
+
+class TestOpportunityReport:
+    def test_creation(self):
+        report = OpportunityReport(
+            opportunities=[
+                Opportunity(opportunity_id="a", title="A"),
+                Opportunity(opportunity_id="b", title="B"),
+            ],
+            summary="Two opportunities found.",
+        )
+        assert len(report.opportunities) == 2
+        assert report.summary == "Two opportunities found."
+
+    def test_defaults(self):
+        report = OpportunityReport()
+        assert report.opportunities == []
+        assert report.summary == ""
+
+    def test_json_roundtrip(self):
+        report = OpportunityReport(
+            opportunities=[Opportunity(opportunity_id="x", title="X")],
+            summary="One opportunity.",
+        )
+        json_str = report.model_dump_json()
+        parsed = OpportunityReport.model_validate_json(json_str)
+        assert len(parsed.opportunities) == 1
+        assert parsed.opportunities[0].opportunity_id == "x"
+
+
+class TestOpportunitySelection:
+    def test_defaults(self):
+        sel = OpportunitySelection()
+        assert sel.action == OpportunitySelectionAction.SELECT
+        assert sel.selected_ids == []
+        assert sel.custom_opportunity == ""
+        assert sel.combination_note == ""
+
+    def test_select(self):
+        sel = OpportunitySelection(
+            action=OpportunitySelectionAction.SELECT,
+            selected_ids=["anomaly_detection", "pred_maint"],
+            combination_note="Combine into unified monitoring.",
+        )
+        assert sel.action == OpportunitySelectionAction.SELECT
+        assert len(sel.selected_ids) == 2
+        assert sel.combination_note == "Combine into unified monitoring."
+
+    def test_custom(self):
+        sel = OpportunitySelection(
+            action=OpportunitySelectionAction.CUSTOM,
+            custom_opportunity="Build an agentic AI decision support system.",
+        )
+        assert sel.action == OpportunitySelectionAction.CUSTOM
+        assert "agentic AI" in sel.custom_opportunity
+
+    def test_abort(self):
+        sel = OpportunitySelection(action=OpportunitySelectionAction.ABORT)
+        assert sel.action == OpportunitySelectionAction.ABORT
+
+    def test_action_values(self):
+        assert OpportunitySelectionAction.SELECT == "select"
+        assert OpportunitySelectionAction.CUSTOM == "custom"
+        assert OpportunitySelectionAction.ABORT == "abort"
+
+
+class TestFeasibilityItem:
+    def test_creation(self):
+        item = FeasibilityItem(
+            area="Data Availability",
+            assessment="Sufficient data in data lake.",
+            risk_level="low",
+            mitigation="",
+        )
+        assert item.area == "Data Availability"
+        assert item.risk_level == "low"
+
+    def test_defaults(self):
+        item = FeasibilityItem(area="Compute")
+        assert item.assessment == ""
+        assert item.risk_level == "low"
+        assert item.mitigation == ""
+
+    def test_json_roundtrip(self):
+        item = FeasibilityItem(
+            area="Timeline",
+            assessment="Tight deadline.",
+            risk_level="high",
+            mitigation="Reduce scope to MVP.",
+        )
+        json_str = item.model_dump_json()
+        parsed = FeasibilityItem.model_validate_json(json_str)
+        assert parsed.area == "Timeline"
+        assert parsed.risk_level == "high"
+        assert parsed.mitigation == "Reduce scope to MVP."
+
+
+class TestFeasibilityReport:
+    def test_creation(self):
+        report = FeasibilityReport(
+            selected_opportunities=["anomaly_detection"],
+            items=[
+                FeasibilityItem(area="Data", assessment="OK", risk_level="low"),
+                FeasibilityItem(area="Compute", assessment="GPU needed", risk_level="medium"),
+            ],
+            overall_feasible=True,
+            overall_summary="Feasible with minor risks.",
+            recommendations=["Provision GPU cluster early."],
+        )
+        assert len(report.items) == 2
+        assert report.overall_feasible is True
+        assert len(report.recommendations) == 1
+
+    def test_defaults(self):
+        report = FeasibilityReport()
+        assert report.selected_opportunities == []
+        assert report.items == []
+        assert report.overall_feasible is True
+        assert report.overall_summary == ""
+        assert report.recommendations == []
+
+    def test_not_feasible(self):
+        report = FeasibilityReport(
+            overall_feasible=False,
+            overall_summary="Critical blockers identified.",
+            items=[
+                FeasibilityItem(
+                    area="Regulatory",
+                    assessment="GDPR blocks data collection.",
+                    risk_level="critical",
+                ),
+            ],
+        )
+        assert report.overall_feasible is False
+        assert report.items[0].risk_level == "critical"
+
+    def test_json_roundtrip(self):
+        report = FeasibilityReport(
+            selected_opportunities=["a", "b"],
+            items=[FeasibilityItem(area="Cost", assessment="High", risk_level="high")],
+            overall_feasible=True,
+            overall_summary="OK.",
+            recommendations=["Optimise costs."],
+        )
+        json_str = report.model_dump_json()
+        parsed = FeasibilityReport.model_validate_json(json_str)
+        assert parsed.selected_opportunities == ["a", "b"]
+        assert len(parsed.items) == 1
+
+
 class TestPipelinePhaseExtended:
     def test_new_phases(self):
         assert PipelinePhase.PLAN_APPROVAL == "plan_approval"
         assert PipelinePhase.PAGE_BUDGET == "page_budget"
         assert PipelinePhase.SUPPLEMENTARY == "supplementary"
+        assert PipelinePhase.OPPORTUNITY_DISCOVERY == "opportunity_discovery"
+        assert PipelinePhase.FEASIBILITY_CHECK == "feasibility_check"
+
+
+class TestPipelineResultExtended:
+    def test_with_opportunity_fields(self):
+        opp_report = OpportunityReport(
+            opportunities=[Opportunity(opportunity_id="x", title="X")],
+        )
+        selection = OpportunitySelection(
+            action=OpportunitySelectionAction.SELECT,
+            selected_ids=["x"],
+        )
+        feas_report = FeasibilityReport(overall_feasible=True)
+        result = PipelineResult(
+            success=True,
+            opportunity_report=opp_report,
+            opportunity_selection=selection,
+            feasibility_report=feas_report,
+        )
+        assert result.opportunity_report is not None
+        assert result.opportunity_selection is not None
+        assert result.feasibility_report is not None
+        assert result.feasibility_report.overall_feasible is True
+
+
+class TestProjectConfigOpportunity:
+    def test_opportunity_defaults(self):
+        config = ProjectConfig()
+        assert config.max_opportunities == 5
+        assert config.feasibility_max_rounds == 2
+
+    def test_custom_opportunity_config(self):
+        config = ProjectConfig(max_opportunities=10, feasibility_max_rounds=4)
+        assert config.max_opportunities == 10
+        assert config.feasibility_max_rounds == 4
