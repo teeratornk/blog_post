@@ -68,6 +68,9 @@ temp/
 **/examples/**/output*/
 **/examples/**/improved_version/
 
+# Source documents
+docs/
+
 # OS files
 Thumbs.db
 .DS_Store
