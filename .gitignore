@@ -64,6 +64,10 @@ output/
 exports/
 temp/
 
+# Generated example outputs
+**/examples/**/output*/
+**/examples/**/improved_version/
+
 # OS files
 Thumbs.db
 .DS_Store
