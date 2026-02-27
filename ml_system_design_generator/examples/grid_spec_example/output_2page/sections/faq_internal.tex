@@ -1,0 +1,40 @@
+
+\section{Internal FAQ — Engineering, Compliance \& Business Questions}
+
+\begin{enumerate}[label=\textbf{\arabic*.}, leftmargin=*, itemsep=0.75em]
+
+\item \textbf{What is the ML approach?}\\
+Gradient-boosted ensemble produces feeder-level outage probabilities using weather, asset condition, vegetation, historical labels, and SCADA anomalies. Conformal prediction provides calibrated uncertainty bands. \textit{See Technical Supplement.}
+
+\item \textbf{How do we meet NERC CIP requirements?}\\
+OT data exits via unidirectional data diode into Azure. Inference runs in a CIP-011-compliant workspace with CIP-005 access controls. The system is \textbf{advisory-only} (no closed-loop control), limiting CIP scope.
+
+\item \textbf{Timeline, team, and cost?}\\
+Six-month MVP: data integration (M1--2), model development (M3--4), deployment \& ops testing (M5--6). Team of 5 engineers plus utility SME. Azure: \$15--25K\,/\,month.
+
+\item \textbf{How do we meet $<$500\,ms latency?}\\
+Pre-computed scores refresh every 15\,min and are cached ($<$50\,ms response). On-demand re-scoring for topology changes uses optimized AKS GPU inference within 500\,ms.
+
+\item \textbf{What happens during unseen extreme events?}\\
+Synthetic oversampling and loss weighting address class imbalance. Ensemble disagreement signals uncertainty; the system falls back to climatological baselines when confidence is low. Human-in-the-loop is mandatory.
+
+\item \textbf{How do we validate with rare storm data?}\\
+Backtesting against 5--10 years of historical storms, synthetic stress tests, and live validation during storm season. Metrics: Brier skill score, reliability diagrams, precision/recall at actionable thresholds.
+
+\item \textbf{Top risks and mitigations?}
+
+\begin{table}[h!]
+\centering
+\caption{Key Risks and Mitigations}\label{tab:faq-risks}
+\begin{tabularx}{\textwidth}{@{} l l X @{}}
+\toprule
+\textbf{Risk} & \textbf{Impact} & \textbf{Mitigation} \\
+\midrule
+Data integration delays & MVP timeline slip & Early IT/OT engagement; parallel pipelines \\
+Poor tail-event calibration & Missed high-impact outages & Conformal prediction; ensemble uncertainty; human override \\
+CIP compliance friction & Deployment blockers & Architecture review in M1 with utility CIP team; advisory-only classification \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\end{enumerate}
