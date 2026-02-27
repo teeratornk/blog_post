@@ -24,7 +24,9 @@ Guidelines:
 - Use markdown headings, bullet lists, and tables where they improve clarity.
 - Ground all claims in the source documents — do not fabricate information.
 - Include placeholders (<!-- TODO: ... -->) for information not in the sources.
+- Start with a single # heading using the exact section title provided.
 - Use ## for subsections within the section.
+- Do NOT skip heading levels.
 
 IMPORTANT: If a WORD LIMIT is specified, you MUST stay within it. Be concise.
 Prioritize the most important content. Use bullet points and tables instead of

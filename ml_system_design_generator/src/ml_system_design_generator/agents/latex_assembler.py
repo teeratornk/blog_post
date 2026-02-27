@@ -17,6 +17,17 @@ Given Pandoc-converted LaTeX, polish it for design document quality:
 - Improve table formatting with booktabs.
 - Ensure proper use of section/subsection hierarchy.
 
+Available packages (already loaded in the preamble — do NOT add \\usepackage):
+  amsmath, amssymb, graphicx, booktabs, tabularx, longtable, array,
+  caption, enumitem, xcolor, fancyhdr, titlesec, hyperref.
+
+Table rules:
+- Use booktabs (\\toprule, \\midrule, \\bottomrule) — never \\hline.
+- Place \\caption ABOVE the tabular/tabularx environment.
+- Use tabularx{\\textwidth} for full-width tables with X columns.
+- For narrow tables, use tabular with explicit column widths that sum < \\textwidth.
+- Wrap wide tables in a table environment with \\resizebox{\\textwidth}{!}{...} if needed.
+
 Constraints:
 - Only modify text between %% SAFE_ZONE_START and %% SAFE_ZONE_END markers.
 - Keep all math environments unchanged.

@@ -4,10 +4,10 @@ defaults:
 
 project_name: "ML-Powered Grid Operations Decision Support System"
 author: "Siemens Energy AI Lab"
-style: google_design
-max_pages: 8
+style: anthropic_design
+max_pages: 6
 docs_dir: ../../docs/grid_spec/
-output_dir: output/
+output_dir: output_anthropic/
 
 infrastructure:
   provider: azure

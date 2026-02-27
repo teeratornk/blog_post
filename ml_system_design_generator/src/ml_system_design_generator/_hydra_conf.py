@@ -101,6 +101,7 @@ class MlsdConf:
         "ConsistencyChecker": True,
         "InfraAdvisor": True,
         "QualityReviewer": True,
+        "LaTeXCosmeticReviewer": True,
     })
 
 

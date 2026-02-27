@@ -156,6 +156,7 @@ def build_role_llm_config(role: str, config: ProjectConfig) -> dict[str, Any]:
         "feasibility_assessor": models.advisor,
         "page_budget": models.reviewer,
         "quality_reviewer": models.reviewer,
+        "latex_cosmetic_reviewer": models.reviewer,
     }
     chosen = role_map.get(role.lower()) or models.default
     override = models.overrides.get(chosen)
