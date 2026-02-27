@@ -315,11 +315,17 @@ def run_latexmk(
 
     pdf_name = main_file.replace(".tex", ".pdf")
     pdf_path = out / pdf_name
+    pdf_was_locked = False
     if pdf_path.exists():
         try:
             pdf_path.unlink()
         except PermissionError:
-            logger.warning("Cannot delete stale PDF %s", pdf_path)
+            logger.warning(
+                "Cannot delete stale PDF %s (file locked by another process). "
+                "Close any PDF viewer and retry.",
+                pdf_path,
+            )
+            pdf_was_locked = True
 
     logger.info("Running: %s (in %s)", " ".join(cmd), out)
 
@@ -336,7 +342,13 @@ def run_latexmk(
     stderr_lower = (proc.stderr or "").lower()
     if proc.returncode != 0 and not pdf_path.exists():
         if any(pat in stderr_lower for pat in _LATEXMK_ENV_ERRORS):
-            logger.warning("latexmk failed, falling back to direct %s", engine)
+            logger.warning("latexmk failed due to environment error, falling back to direct %s", engine)
+            return _run_direct_engine(out, engine, main_file, timeout)
+
+    # If latexmk environment is broken but stale PDF masks the failure, fall back
+    if pdf_was_locked and proc.returncode != 0:
+        if any(pat in stderr_lower for pat in _LATEXMK_ENV_ERRORS):
+            logger.warning("latexmk broken and PDF locked, falling back to direct %s", engine)
             return _run_direct_engine(out, engine, main_file, timeout)
 
     return _build_result(proc, out, main_file, "latexmk")

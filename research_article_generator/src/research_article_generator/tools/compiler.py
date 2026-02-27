@@ -406,6 +406,7 @@ def run_latexmk(
     # Remove stale PDF so pdf_path.exists() reliably indicates THIS run produced it
     pdf_name = main_file.replace(".tex", ".pdf")
     pdf_path = out / pdf_name
+    pdf_was_locked = False
     if pdf_path.exists():
         try:
             pdf_path.unlink()
@@ -415,6 +416,7 @@ def run_latexmk(
                 "Close any PDF viewer and retry.",
                 pdf_path,
             )
+            pdf_was_locked = True
 
     logger.info("Running: %s (in %s)", " ".join(cmd), out)
 
@@ -440,6 +442,15 @@ def run_latexmk(
             logger.warning(
                 "latexmk failed due to environment issue, falling back to direct %s: %s",
                 engine, proc.stderr.strip()[:200],
+            )
+            return _run_direct_engine(out, engine, main_file, timeout)
+
+    # If latexmk environment is broken but stale PDF masks the failure, fall back
+    if pdf_was_locked and proc.returncode != 0:
+        if any(pat in stderr_lower for pat in _LATEXMK_ENV_ERRORS):
+            logger.warning(
+                "latexmk broken and PDF locked, falling back to direct %s",
+                engine,
             )
             return _run_direct_engine(out, engine, main_file, timeout)
 
