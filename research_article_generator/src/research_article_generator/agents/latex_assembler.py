@@ -42,7 +42,16 @@ Tone rule — fact-based writing:
 - The Discussion section may include interpretation, limitations, and outlook.
 
 {template_context_block}\
+{table_rules_block}\
 Return the polished LaTeX only, without explanations or markdown fences.
+"""
+
+_TABLE_RULES = """\
+Table rules:
+- Use booktabs (\\toprule, \\midrule, \\bottomrule) — never \\hline.
+- Place \\caption ABOVE the tabular/tabularx environment.
+- Use tabularx{{\\textwidth}} for full-width tables with X columns.
+- The preamble already loads: booktabs, tabularx, longtable, array.
 """
 
 
@@ -68,6 +77,7 @@ def make_assembler(
         system_message=SYSTEM_PROMPT_TEMPLATE.format(
             journal_name=journal,
             template_context_block=block,
+            table_rules_block=_TABLE_RULES,
         ),
         llm_config=build_role_llm_config("assembler", config),
     )

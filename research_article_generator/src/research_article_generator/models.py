@@ -297,6 +297,14 @@ class PipelineResult(BaseModel):
 # Project Configuration (loaded from YAML)
 # ---------------------------------------------------------------------------
 
+class ModelEndpointOverride(BaseModel):
+    """Per-model endpoint override for models on different Azure resources."""
+    endpoint: str = Field(description="Azure endpoint or base URL for this model")
+    api_key: str | None = Field(default=None, description="API key (falls back to azure.api_key)")
+    api_version: str | None = Field(default=None, description="API version (falls back to azure.api_version)")
+    api_type: str | None = Field(default=None, description="Force api_type: 'anthropic', 'azure', or None for auto-detect")
+
+
 class ModelConfig(BaseModel):
     """LLM model configuration per role."""
     default: str = Field(default="gpt-5.2", description="Default model")
@@ -304,6 +312,10 @@ class ModelConfig(BaseModel):
     planner: str | None = Field(default=None)
     reviewer: str | None = Field(default=None)
     editor: str | None = Field(default=None)
+    overrides: dict[str, ModelEndpointOverride] = Field(
+        default_factory=dict,
+        description="Per-model endpoint overrides keyed by model name",
+    )
 
 
 class AzureConfig(BaseModel):
@@ -361,6 +373,7 @@ class ProjectConfig(BaseModel):
             "FaithfulnessChecker": True,
             "MetaReviewer": True,
             "PlanReviewer": True,
+            "LaTeXCosmeticReviewer": True,
         }
     )
 

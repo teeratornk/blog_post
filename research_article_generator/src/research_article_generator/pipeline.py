@@ -23,6 +23,7 @@ from .agents.citation_agent import make_citation_agent
 from .agents.equation_formatter import make_equation_formatter
 from .agents.figure_integrator import make_figure_integrator
 from .agents.figure_suggester import make_figure_suggester
+from .agents.latex_cosmetic_reviewer import make_latex_cosmetic_reviewer
 from .agents.tikz_generator import make_tikz_generator, make_tikz_reviewer, validate_tikz_review
 from .agents.latex_assembler import make_assembler
 from .agents.page_budget_manager import make_page_budget_manager
@@ -50,6 +51,7 @@ from .models import (
 )
 from .tools.compiler import extract_error_context, run_latexmk
 from .tools.diff_checker import run_faithfulness_check
+from .tools.latex_linter import autofix_section
 from .tools.latex_builder import (
     assemble_document,
     assemble_main_tex,
@@ -587,6 +589,86 @@ class Pipeline:
 
         return collected
 
+    def _cosmetic_review(
+        self,
+        orchestrator: autogen.UserProxyAgent,
+        assembler: autogen.AssistantAgent,
+    ) -> None:
+        """Run LLM cosmetic review on assembled LaTeX (single pass).
+
+        If the reviewer finds ERROR/CRITICAL issues, affected sections are
+        re-polished by the LaTeXAssembler with the cosmetic feedback.
+        """
+        reviewer = make_latex_cosmetic_reviewer(self.config)
+        if reviewer is None:
+            return
+
+        # Concatenate all sections for a holistic review
+        combined = "\n\n".join(
+            f"%%% Section: {sid} %%%\n{latex}"
+            for sid, latex in self.section_latex.items()
+        )
+
+        try:
+            self.callbacks.on_section_review("all", "LaTeXCosmeticReviewer")
+            response = orchestrator.initiate_chat(
+                reviewer,
+                message=(
+                    "Review the following assembled LaTeX sections for cosmetic "
+                    "and structural issues.\n\n" + combined
+                ),
+                max_turns=1,
+            )
+            raw = _extract_latex(response)
+            feedback, _err = validate_review(raw)
+
+            if feedback is None:
+                return
+            if "no issues" in (feedback.Review or "").lower():
+                return
+            if feedback.severity not in (Severity.ERROR, Severity.CRITICAL):
+                self.callbacks.on_warning(
+                    f"LaTeXCosmeticReviewer ({feedback.severity.value}): "
+                    f"{feedback.Review[:150]}"
+                )
+                return
+
+            # Re-polish affected sections with cosmetic feedback
+            self.callbacks.on_warning(
+                f"LaTeXCosmeticReviewer ({feedback.severity.value}): "
+                f"{feedback.Review[:150]}"
+            )
+            affected = [
+                sid for sid in self.section_latex if sid in feedback.Review
+            ]
+            if not affected:
+                # If no sections identified, re-polish all
+                affected = list(self.section_latex.keys())
+
+            for sid in affected:
+                if sid not in self.section_latex:
+                    continue
+                try:
+                    fix_response = orchestrator.initiate_chat(
+                        assembler,
+                        message=(
+                            f"Fix the cosmetic issues in section '{sid}' "
+                            f"identified by the reviewer.\n\n"
+                            f"COSMETIC FEEDBACK:\n{feedback.Review}\n\n"
+                            f"SECTION CONTENT:\n{self.section_latex[sid]}"
+                        ),
+                        max_turns=1,
+                    )
+                    fixed = _extract_latex(fix_response)
+                    if fixed and _looks_like_latex(fixed):
+                        self.section_latex[sid] = fixed
+                except Exception as e:
+                    self.callbacks.on_warning(
+                        f"Cosmetic fix skipped for {sid}: {e}"
+                    )
+        except Exception as e:
+            self.callbacks.on_warning(f"LaTeXCosmeticReviewer skipped: {e}")
+
     def run_conversion(self) -> dict[str, str]:
         """Phase 2: Convert each section via Pandoc + LLM polish + per-section review."""
         if not self.structure_plan:
@@ -795,6 +877,18 @@ class Pipeline:
 
             self.section_latex[section_id] = latex
             self.callbacks.on_section_end(section_id)
+
+        # Deterministic lint + auto-fix each section
+        for section_id in list(self.section_latex):
+            fixed, issues = autofix_section(section_id, self.section_latex[section_id])
+            if issues:
+                for issue in issues:
+                    self.callbacks.on_warning(f"Lint: {issue}")
+            self.section_latex[section_id] = fixed
+
+        # LLM cosmetic review (single pass over all sections)
+        assembler = make_assembler(self.config, template_context=self.template_context)
+        self._cosmetic_review(orchestrator, assembler)
 
         # Multi-file assembly: write sections/*.tex + main.tex skeleton
         self.output_dir.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,7 @@ At runtime the Hydra DictConfig is converted to ``ProjectConfig`` via
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from hydra.core.config_store import ConfigStore
 
@@ -20,12 +21,21 @@ class AzureConf:
 
 
 @dataclass
+class ModelEndpointOverrideConf:
+    endpoint: str = ""
+    api_key: str | None = None
+    api_version: str | None = None
+    api_type: str | None = None
+
+
+@dataclass
 class ModelConf:
     default: str = "gpt-5.2"
     assembler: str | None = None
     planner: str | None = None
     reviewer: str | None = None
     editor: str | None = None
+    overrides: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -82,6 +92,7 @@ class RagConf:
         "FaithfulnessChecker": True,
         "MetaReviewer": True,
         "PlanReviewer": True,
+        "LaTeXCosmeticReviewer": True,
     })
 
     tikz_enabled: bool = False

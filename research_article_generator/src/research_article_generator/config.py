@@ -15,7 +15,7 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-from .models import AzureConfig, ModelConfig, ProjectConfig
+from .models import AzureConfig, ModelConfig, ModelEndpointOverride, ProjectConfig
 
 load_dotenv()
 
@@ -76,21 +76,54 @@ def load_config(config_path: str | Path) -> ProjectConfig:
 # LLM config builder (adapted from blog_post/config.py)
 # ---------------------------------------------------------------------------
 
+def _is_azure_openai_endpoint(endpoint: str) -> bool:
+    """Return True for Azure OpenAI endpoints, False for Azure AI Model Inference."""
+    lower = endpoint.lower()
+    return "openai.azure.com" in lower or "cognitiveservices.azure.com" in lower
+
+
 def _build_single_entry(
     model: str,
     azure: AzureConfig,
+    override: ModelEndpointOverride | None = None,
 ) -> dict[str, Any]:
-    """Build a single AG2 config_list entry for the given model."""
+    """Build a single AG2 config_list entry for the given model.
+
+    When an override specifies ``api_type`` (e.g. ``"anthropic"``), that type
+    is used directly with the override endpoint as ``base_url``.
+
+    Otherwise Azure OpenAI endpoints (``openai.azure.com``,
+    ``cognitiveservices.azure.com``) use ``api_type: "azure"`` with
+    deployment-based routing, and other endpoints are treated as
+    OpenAI-compatible via ``base_url``.
+    """
+    api_key = azure.api_key
+    api_version = azure.api_version
+    endpoint = azure.endpoint
+    forced_api_type: str | None = None
+
+    if override:
+        endpoint = override.endpoint.rstrip("/")
+        if override.api_key:
+            api_key = override.api_key
+        if override.api_version:
+            api_version = override.api_version
+        forced_api_type = override.api_type
+
     entry: dict[str, Any] = {
         "model": model,
-        "api_key": azure.api_key,
+        "api_key": api_key,
     }
-    endpoint = azure.endpoint
-    if endpoint and ("azure" in endpoint.lower() or "cognitiveservices" in endpoint.lower()):
+
+    if forced_api_type:
+        # Explicit api_type from override (e.g. "anthropic")
+        entry["api_type"] = forced_api_type
+        entry["base_url"] = endpoint
+    elif endpoint and _is_azure_openai_endpoint(endpoint):
         entry.update({
             "api_type": "azure",
             "azure_endpoint": endpoint,
-            "api_version": azure.api_version,
+            "api_version": api_version,
             "azure_deployment": model,
         })
     elif endpoint:
@@ -106,6 +139,10 @@ def build_role_llm_config(role: str, config: ProjectConfig) -> dict[str, Any]:
     - ``planner`` → models.planner (or default)
     - ``reviewer`` / all reviewer names → models.reviewer (or default)
     - ``editor`` → models.editor (or default)
+
+    If ``config.models.overrides`` contains an entry for the chosen model name,
+    that entry's endpoint / api_key / api_version take precedence over the
+    global ``config.azure`` values.
     """
     models = config.models
     role_map: dict[str, str | None] = {
@@ -125,9 +162,11 @@ def build_role_llm_config(role: str, config: ProjectConfig) -> dict[str, Any]:
         "plan_reviewer": models.reviewer,
         "page_budget": models.reviewer,
         "editor": models.editor,
+        "latex_cosmetic_reviewer": models.reviewer,
     }
     chosen = role_map.get(role.lower()) or models.default
-    entry = _build_single_entry(chosen, config.azure)
+    override = models.overrides.get(chosen)
+    entry = _build_single_entry(chosen, config.azure, override=override)
     return {
         "config_list": [entry],
         "timeout": config.timeout,
